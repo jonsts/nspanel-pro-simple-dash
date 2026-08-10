@@ -19,22 +19,73 @@ const DEFAULT_GLOBAL_CONFIG = {
     haToken: '',
     assistantEntity: '', // Google Assistant SDK entity
     disableBuiltInScreensaver: false,
-    screensaverTimeout: 10 // seconds
+    screensaverTimeout: 10, // seconds
+    screensaverTimeFormat: '24h', // '24h' or '12h'
+    hideVoiceMessages: false,
+    deviceModel: 'pro',
+    fontFamily: 'Inter'
 };
 
-const ENTITIES_PER_PAGE = 4;
+// Split entities into pages by simulating the grid's row-major auto-placement
+// (mirrors CSS Grid's sparse packing), so tiles with a configured width/height
+// other than 1x1 are accounted for and a page never overflows its reserved rows.
+function paginateEntities(items, gridColumns, gridRows) {
+    const maxRows = gridRows * 2; // physical row-tracks per page (half-height units)
+    const pages = [];
+    let page = [];
+    let occupied = new Set();
+    let cursorRow = 0;
+    let cursorCol = 0;
 
-// Get entities per page from config
-function getEntitiesPerPage() {
-    if (!config) return ENTITIES_PER_PAGE;
-    const cols = config.gridColumns || 2;
-    const rows = config.gridRows || 2;
-    return cols * rows;
-}
-function getEntitiesPerPage() {
-    const cols = config.gridColumns || 2;
-    const rows = config.gridRows || 2;
-    return cols * rows;
+    const fits = (row, col, colSpan, rowSpan) => {
+        if (col + colSpan > gridColumns || row + rowSpan > maxRows) return false;
+        for (let r = row; r < row + rowSpan; r++) {
+            for (let c = col; c < col + colSpan; c++) {
+                if (occupied.has(`${r},${c}`)) return false;
+            }
+        }
+        return true;
+    };
+
+    const place = (row, col, colSpan, rowSpan) => {
+        for (let r = row; r < row + rowSpan; r++) {
+            for (let c = col; c < col + colSpan; c++) {
+                occupied.add(`${r},${c}`);
+            }
+        }
+    };
+
+    const findSlot = (startRow, startCol, colSpan, rowSpan) => {
+        let row = startRow, col = startCol;
+        while (row < maxRows) {
+            if (fits(row, col, colSpan, rowSpan)) return { row, col };
+            col++;
+            if (col >= gridColumns) { col = 0; row++; }
+        }
+        return null;
+    };
+
+    for (const item of items) {
+        const colSpan = Math.min(item.tileColSpan || 1, gridColumns);
+        const rowSpan = item.tileHeight === 'half' ? 1 : 2;
+
+        let slot = findSlot(cursorRow, cursorCol, colSpan, rowSpan);
+        if (!slot) {
+            if (page.length) pages.push(page);
+            page = [];
+            occupied = new Set();
+            slot = findSlot(0, 0, colSpan, rowSpan) || { row: 0, col: 0 };
+        }
+
+        place(slot.row, slot.col, colSpan, rowSpan);
+        page.push(item);
+        cursorRow = slot.row;
+        cursorCol = slot.col + colSpan;
+        if (cursorCol >= gridColumns) { cursorCol = 0; cursorRow++; }
+    }
+
+    if (page.length) pages.push(page);
+    return pages;
 }
 
 // ============================================
@@ -56,6 +107,51 @@ let lastAlbumArtUrl = '';
 let nowPlayingFlipInterval = null;
 let nowPlayingCurrentLine = 0;
 let isSliderDragging = false;
+const forecastCache = {};
+const WEATHER_ICONS = {
+    'clear-night': 'nightlight',
+    'cloudy': 'cloud',
+    'fog': 'foggy',
+    'hail': 'weather_hail',
+    'lightning': 'thunderstorm',
+    'lightning-rainy': 'thunderstorm',
+    'partlycloudy': 'partly_cloudy_day',
+    'pouring': 'rainy_heavy',
+    'rainy': 'rainy',
+    'snowy': 'weather_snowy',
+    'snowy-rainy': 'weather_mix',
+    'sunny': 'sunny',
+    'windy': 'air',
+    'windy-variant': 'air',
+    'exceptional': 'warning'
+};
+
+const WEATHER_CONDITION_LABELS = {
+    'clear-night': 'Clear',
+    'cloudy': 'Cloudy',
+    'fog': 'Fog',
+    'hail': 'Hail',
+    'lightning': 'Lightning',
+    'lightning-rainy': 'Lightning, Rainy',
+    'partlycloudy': 'Partly Cloudy',
+    'pouring': 'Pouring',
+    'rainy': 'Rainy',
+    'snowy': 'Snowy',
+    'snowy-rainy': 'Snowy, Rainy',
+    'sunny': 'Sunny',
+    'windy': 'Windy',
+    'windy-variant': 'Windy',
+    'exceptional': 'Exceptional'
+};
+
+// Format a Home Assistant weather condition string for display (e.g. "partlycloudy" -> "Partly Cloudy")
+function formatWeatherCondition(state) {
+    if (!state) return 'Unknown';
+    return WEATHER_CONDITION_LABELS[state] || state
+        .replace(/-/g, ' ')
+        .replace(/([a-z])([A-Z])/g, '$1 $2')
+        .replace(/\b\w/g, c => c.toUpperCase());
+}
 
 async function loadConfig() {
     try {
@@ -236,6 +332,7 @@ async function callService(domain, service, entityId) {
 // UI RENDERING
 // ============================================
 function renderPages() {
+    document.getElementById('loadingOverlay').classList.add('hidden');
     const wrapper = document.getElementById('pagesWrapper');
     const dotsContainer = document.getElementById('pageDots');
     wrapper.innerHTML = '';
@@ -262,12 +359,11 @@ function renderPages() {
     
     const allRegularItems = [...regularEntities, ...assistantCommandTiles, ...spotifyPlaylistTiles];
 
-    const entitiesPerPage = getEntitiesPerPage();
-    const totalPages = Math.ceil(allRegularItems.length / entitiesPerPage);
-
     // Set grid layout
     const gridColumns = config.gridColumns || 2;
     const gridRows = config.gridRows || 2;
+    const regularPages = paginateEntities(allRegularItems, gridColumns, gridRows);
+    const totalPages = regularPages.length;
 
     // Create regular entity pages
     for (let i = 0; i < totalPages; i++) {
@@ -291,15 +387,12 @@ function renderPages() {
         const grid = document.createElement('div');
         grid.className = 'grid';
         grid.style.gridTemplateColumns = `repeat(${gridColumns}, 1fr)`;
-        grid.style.gridTemplateRows = `repeat(${gridRows}, 1fr)`;
+        grid.style.gridTemplateRows = `repeat(${gridRows * 2}, 1fr)`;
 
-        const startIdx = i * entitiesPerPage;
-        const endIdx = Math.min(startIdx + entitiesPerPage, allRegularItems.length);
-        
-        for (let j = startIdx; j < endIdx; j++) {
-            const entity = allRegularItems[j];
+        for (const entity of regularPages[i]) {
             const state = entityStates[entity.id];
             const tile = createTile(entity, state);
+            applyTileSize(tile, entity);
             grid.appendChild(tile);
         }
 
@@ -767,8 +860,9 @@ function goToMediaPage() {
         icon: playlist.icon || 'queue_music'
     }));
     const allRegularItems = [...regularEntities, ...assistantCommandTiles, ...spotifyPlaylistTiles];
-    const entitiesPerPage = getEntitiesPerPage();
-    const totalRegularPages = Math.ceil(allRegularItems.length / entitiesPerPage);
+    const gridColumns = config.gridColumns || 2;
+    const gridRows = config.gridRows || 2;
+    const totalRegularPages = paginateEntities(allRegularItems, gridColumns, gridRows).length;
     goToPage(totalRegularPages);
 }
 
@@ -826,6 +920,13 @@ function openHeaderClimateModal() {
     }
 }
 
+function applyTileSize(tile, entity) {
+    if (entity.tileColSpan && entity.tileColSpan > 1) {
+        tile.style.gridColumn = `span ${entity.tileColSpan}`;
+    }
+    if (entity.tileHeight === 'half') tile.classList.add('tile-half-height');
+}
+
 function createTile(entity, state) {
     const tile = document.createElement('div');
     tile.className = 'tile';
@@ -841,7 +942,12 @@ function createTile(entity, state) {
     if (domain === 'spotify_playlist') {
         return createSpotifyPlaylistTile(entity);
     }
-    
+
+    // Handle clock tiles
+    if (domain === 'clock') {
+        return createClockTile(entity);
+    }
+
     // Handle different entity types
     if (domain === 'climate') {
         return createClimateTile(entity, state);
@@ -858,15 +964,18 @@ function createTile(entity, state) {
     }
 
     const stateValue = state ? state.state : null;
-    const isOn = stateValue === 'on' || stateValue === 'playing';
+    const isOn = stateValue === 'on' || stateValue === 'playing' || stateValue === 'unlocked';
     const isUnavailable = !state || stateValue === 'unavailable';
 
+    tile.classList.add(domain);
     if (isOn) {
-        tile.classList.add('on', domain);
+        tile.classList.add('on');
     }
 
     if (isUnavailable) {
         tile.classList.add('unavailable');
+    } else if (entity.disableAction) {
+        tile.classList.add('no-action');
     }
 
     // Add icon
@@ -895,7 +1004,7 @@ function createTile(entity, state) {
     tile.appendChild(icon);
     tile.appendChild(content);
 
-    if (!isUnavailable) {
+    if (!isUnavailable && !entity.disableAction) {
         tile.onclick = () => handleTileClick(entity.id, domain);
     }
 
@@ -952,6 +1061,27 @@ function createSpotifyPlaylistTile(entity) {
     tile.appendChild(content);
 
     tile.onclick = () => playSpotifyPlaylistOnRoomDevice(entity.playlistUrl);
+
+    return tile;
+}
+
+function createClockTile(entity) {
+    const tile = document.createElement('div');
+    tile.className = 'tile clock no-tap';
+
+    const now = new Date();
+
+    const timeDisplay = document.createElement('div');
+    timeDisplay.className = 'clock-time';
+    timeDisplay.textContent = formatClockTime(now, entity.clockTimeFormat);
+    tile.appendChild(timeDisplay);
+
+    if (!entity.hideClockDate) {
+        const dateDisplay = document.createElement('div');
+        dateDisplay.className = 'clock-date';
+        dateDisplay.textContent = now.toLocaleDateString('en', { weekday: 'short', month: 'short', day: 'numeric' });
+        tile.appendChild(dateDisplay);
+    }
 
     return tile;
 }
@@ -1055,7 +1185,8 @@ function createLightTile(entity, state) {
     const stateValue = state ? state.state : null;
     const isOn = stateValue === 'on';
     const isUnavailable = !state || stateValue === 'unavailable';
-    const isDimmable = state.attributes.supported_color_modes && 
+    const isDimmable = !entity.disableDimming && !entity.disableAction &&
+        state.attributes.supported_color_modes &&
         state.attributes.supported_color_modes.some(mode => mode !== 'onoff');
 
     if (isOn) {
@@ -1064,8 +1195,10 @@ function createLightTile(entity, state) {
 
     if (isUnavailable) {
         tile.classList.add('unavailable');
+    } else if (entity.disableAction) {
+        tile.classList.add('no-action');
     }
-    
+
     if (isDimmable && !isUnavailable) {
         tile.classList.add('has-slider');
     }
@@ -1073,7 +1206,7 @@ function createLightTile(entity, state) {
     // Add icon
     const icon = document.createElement('div');
     icon.className = 'tile-icon';
-    icon.textContent = 'lightbulb';
+    icon.textContent = entity.icon || 'lightbulb';
 
     // Add content wrapper
     const content = document.createElement('div');
@@ -1157,17 +1290,17 @@ function createLightTile(entity, state) {
                 const brightnessChange = -(deltaY / tileHeight) * 255;
                 let newBrightness = Math.round(swipeStartBrightness + brightnessChange);
                 newBrightness = Math.max(0, Math.min(255, newBrightness));
-                
+
                 setBrightness(entity.id, newBrightness);
-            } else {
-                // It was a tap, toggle the light
-                handleTileClick(entity.id, 'light');
+                e.preventDefault(); // block synthetic click after a swipe
             }
-            
+
             isSliderDragging = false;
             isSwiping = false;
-        }, { passive: true });
-    } else if (!isUnavailable) {
+        }, { passive: false });
+
+        tile.onclick = () => handleTileClick(entity.id, 'light');
+    } else if (!isUnavailable && !entity.disableAction) {
         tile.onclick = () => handleTileClick(entity.id, 'light');
     }
 
@@ -1208,9 +1341,11 @@ function createCoverTile(entity, state) {
 
     if (isUnavailable) {
         tile.classList.add('unavailable');
+    } else if (entity.disableAction) {
+        tile.classList.add('no-action');
     }
-    
-    if (supportsPosition && !isUnavailable) {
+
+    if (supportsPosition && !isUnavailable && !entity.disableAction) {
         tile.classList.add('has-slider');
     }
 
@@ -1246,7 +1381,7 @@ function createCoverTile(entity, state) {
     tile.appendChild(content);
 
     // Add position progress bar for covers with position support
-    if (supportsPosition && !isUnavailable) {
+    if (supportsPosition && !isUnavailable && !entity.disableAction) {
         const progressContainer = document.createElement('div');
         progressContainer.className = 'brightness-slider-container';
         
@@ -1303,17 +1438,17 @@ function createCoverTile(entity, state) {
                 const positionChange = -(deltaY / tileHeight) * 100;
                 let newPosition = Math.round(swipeStartPosition + positionChange);
                 newPosition = Math.max(0, Math.min(100, newPosition));
-                
+
                 setCoverPosition(entity.id, newPosition);
-            } else {
-                // It was a tap, toggle the cover
-                handleTileClick(entity.id, 'cover');
+                e.preventDefault(); // block synthetic click after a swipe
             }
-            
+
             isSliderDragging = false;
             isSwiping = false;
-        }, { passive: true });
-    } else if (!isUnavailable) {
+        }, { passive: false });
+
+        tile.onclick = () => handleTileClick(entity.id, 'cover');
+    } else if (!isUnavailable && !entity.disableAction) {
         tile.onclick = () => handleTileClick(entity.id, 'cover');
     }
 
@@ -1369,6 +1504,8 @@ function createClimateTile(entity, state) {
 
     if (isUnavailable) {
         tile.classList.add('unavailable');
+    } else if (entity.disableAction) {
+        tile.classList.add('no-action');
     }
 
     const label = document.createElement('div');
@@ -1377,7 +1514,7 @@ function createClimateTile(entity, state) {
 
     const tempDisplay = document.createElement('div');
     tempDisplay.className = 'temp-display';
-    
+
     if (state && state.attributes.current_temperature !== undefined) {
         const currentTemp = Math.round(state.attributes.current_temperature);
         const targetTemp = state.attributes.temperature ? Math.round(state.attributes.temperature) : null;
@@ -1401,7 +1538,7 @@ function createClimateTile(entity, state) {
     }
 
     // Open climate modal on click
-    if (!isUnavailable) {
+    if (!isUnavailable && !entity.disableAction) {
         tile.onclick = () => openClimateModal(entity.id);
     }
 
@@ -1410,7 +1547,7 @@ function createClimateTile(entity, state) {
 
 function createSensorTile(entity, state) {
     const tile = document.createElement('div');
-    tile.className = 'tile sensor';
+    tile.className = 'tile sensor no-tap';
 
     const isUnavailable = !state || state.state === 'unavailable';
     
@@ -1427,9 +1564,10 @@ function createSensorTile(entity, state) {
     
     if (state && state.state !== 'unavailable' && state.state !== 'unknown') {
         const value = parseFloat(state.state);
-        const displayValue = isNaN(value) ? state.state : Math.round(value);
+        const decimals = entity.decimals !== undefined ? entity.decimals : 0;
+        const displayValue = isNaN(value) ? state.state : value.toFixed(decimals);
         const unit = state.attributes.unit_of_measurement || '';
-        
+
         tempDisplay.innerHTML = `${displayValue}<span class="temp-unit">${unit}</span>`;
     } else {
         tempDisplay.textContent = '—';
@@ -1446,44 +1584,28 @@ function createWeatherTile(entity, state) {
     tile.className = 'tile weather';
 
     const isUnavailable = !state || state.state === 'unavailable';
-    
-    if (isUnavailable) {
-        tile.classList.add('unavailable');
+    if (isUnavailable) tile.classList.add('unavailable');
+    if (entity.tileColSpan > 1) tile.classList.add('full-row');
+
+    if (!entity.hideWeatherIcon) {
+        const icon = document.createElement('div');
+        icon.className = 'tile-icon weather-icon';
+        icon.textContent = WEATHER_ICONS[state?.state] || 'cloud';
+        tile.appendChild(icon);
     }
-
-    // Weather icon mapping
-    const weatherIcons = {
-        'clear-night': 'nightlight',
-        'cloudy': 'cloud',
-        'fog': 'foggy',
-        'hail': 'weather_hail',
-        'lightning': 'thunderstorm',
-        'lightning-rainy': 'thunderstorm',
-        'partlycloudy': 'partly_cloudy_day',
-        'pouring': 'rainy_heavy',
-        'rainy': 'rainy',
-        'snowy': 'weather_snowy',
-        'snowy-rainy': 'weather_mix',
-        'sunny': 'sunny',
-        'windy': 'air',
-        'windy-variant': 'air',
-        'exceptional': 'warning'
-    };
-
-    const icon = document.createElement('div');
-    icon.className = 'tile-icon weather-icon';
-    icon.textContent = weatherIcons[state?.state] || 'cloud';
 
     const content = document.createElement('div');
     content.className = 'tile-content';
 
-    const label = document.createElement('div');
-    label.className = 'tile-label';
-    label.textContent = entity.label;
+    if (!entity.hideWeatherName) {
+        const label = document.createElement('div');
+        label.className = 'tile-label';
+        label.textContent = entity.label;
+        content.appendChild(label);
+    }
 
     const tempDisplay = document.createElement('div');
     tempDisplay.className = 'weather-temp';
-    
     if (state && state.attributes.temperature !== undefined) {
         const temp = Math.round(state.attributes.temperature);
         const unit = state.attributes.temperature_unit || '°C';
@@ -1494,21 +1616,28 @@ function createWeatherTile(entity, state) {
 
     const condition = document.createElement('div');
     condition.className = 'weather-condition';
-    condition.textContent = state?.state ? state.state.replace('-', ' ').toUpperCase() : 'UNKNOWN';
+    condition.textContent = state?.state ? formatWeatherCondition(state.state).toUpperCase() : 'UNKNOWN';
 
-    content.appendChild(label);
     content.appendChild(tempDisplay);
     content.appendChild(condition);
-
-    tile.appendChild(icon);
     tile.appendChild(content);
 
-    // Open forecast modal on click
-    if (!isUnavailable) {
+    if (entity.showInlineForecast && entity.tileHeight !== 'half') {
+        tile.dataset.entityId = entity.id;
+        const tileForecastType = entity.tileForecastType || 'daily';
+        const cached = forecastCache[entity.id];
+        if (cached?.type === tileForecastType && cached.data.length > 0) {
+            renderInlineForecastStrip(tile, cached.data, tileForecastType);
+        } else {
+            fetchInlineForecast(entity.id, tileForecastType);
+        }
+    }
+
+    if (!isUnavailable && !entity.hideWeatherForecast && !entity.disableAction) {
         tile.onclick = () => openWeatherForecast(entity.id);
         tile.style.cursor = 'pointer';
-    } else {
-        tile.style.cursor = 'default';
+    } else if (!isUnavailable && entity.disableAction) {
+        tile.classList.add('no-action');
     }
 
     return tile;
@@ -1527,6 +1656,8 @@ function createMediaPlayerTile(entity, state) {
 
     if (isUnavailable) {
         tile.classList.add('unavailable');
+    } else if (entity.disableAction) {
+        tile.classList.add('no-action');
     }
 
     // Add album art background if available
@@ -1587,10 +1718,10 @@ function createMediaPlayerTile(entity, state) {
     tile.appendChild(content);
 
     // Add media controls
-    if (!isUnavailable) {
+    if (!isUnavailable && !entity.disableAction) {
         const controls = document.createElement('div');
         controls.className = 'media-controls';
-        
+
         const prevBtn = document.createElement('button');
         prevBtn.className = 'media-btn';
         prevBtn.textContent = 'skip_previous';
@@ -1598,7 +1729,7 @@ function createMediaPlayerTile(entity, state) {
             e.stopPropagation();
             callService('media_player', 'media_previous_track', entity.id);
         };
-        
+
         const playPauseBtn = document.createElement('button');
         playPauseBtn.className = 'media-btn play-pause';
         playPauseBtn.textContent = isPlaying ? 'pause' : 'play_arrow';
@@ -1606,7 +1737,7 @@ function createMediaPlayerTile(entity, state) {
             e.stopPropagation();
             callService('media_player', 'media_play_pause', entity.id);
         };
-        
+
         const nextBtn = document.createElement('button');
         nextBtn.className = 'media-btn';
         nextBtn.textContent = 'skip_next';
@@ -1614,7 +1745,7 @@ function createMediaPlayerTile(entity, state) {
             e.stopPropagation();
             callService('media_player', 'media_next_track', entity.id);
         };
-        
+
         controls.appendChild(prevBtn);
         controls.appendChild(playPauseBtn);
         controls.appendChild(nextBtn);
@@ -1707,6 +1838,9 @@ function handleTileClick(entityId, domain) {
         case 'cover':
             service = 'toggle';
             break;
+        case 'lock':
+            service = entityStates[entityId]?.state === 'locked' ? 'unlock' : 'lock';
+            break;
         case 'group':
             // Groups use homeassistant domain for toggle
             callService('homeassistant', 'toggle', entityId);
@@ -1752,8 +1886,14 @@ function goToPage(pageIndex) {
         label: cmd.label,
         command: cmd.command
     }));
-    const allRegularItems = [...regularEntities, ...assistantCommandTiles];
-    const totalRegularPages = Math.ceil(allRegularItems.length / ENTITIES_PER_PAGE);
+    const spotifyPlaylistTiles = (config.spotifyPlaylists || []).map(playlist => ({
+        id: `spotify_playlist.${playlist.label.toLowerCase().replace(/\s+/g, '_')}`,
+        label: playlist.label,
+        playlistUrl: playlist.playlistUrl,
+        icon: playlist.icon || 'queue_music'
+    }));
+    const allRegularItems = [...regularEntities, ...assistantCommandTiles, ...spotifyPlaylistTiles];
+    const totalRegularPages = paginateEntities(allRegularItems, config.gridColumns || 2, config.gridRows || 2).length;
     const totalPages = totalRegularPages + (mediaPlayers.length > 0 ? 1 : 0);
     
     currentPage = Math.max(0, Math.min(pageIndex, totalPages - 1));
@@ -1784,8 +1924,14 @@ function nextPage() {
         label: cmd.label,
         command: cmd.command
     }));
-    const allRegularItems = [...regularEntities, ...assistantCommandTiles];
-    const totalRegularPages = Math.ceil(allRegularItems.length / ENTITIES_PER_PAGE);
+    const spotifyPlaylistTiles = (config.spotifyPlaylists || []).map(playlist => ({
+        id: `spotify_playlist.${playlist.label.toLowerCase().replace(/\s+/g, '_')}`,
+        label: playlist.label,
+        playlistUrl: playlist.playlistUrl,
+        icon: playlist.icon || 'queue_music'
+    }));
+    const allRegularItems = [...regularEntities, ...assistantCommandTiles, ...spotifyPlaylistTiles];
+    const totalRegularPages = paginateEntities(allRegularItems, config.gridColumns || 2, config.gridRows || 2).length;
     const totalPages = totalRegularPages + (mediaPlayers.length > 0 ? 1 : 0);
     
     if (currentPage < totalPages - 1) {
@@ -1804,20 +1950,21 @@ function prevPage() {
 // ============================================
 function setupTouchHandlers() {
     const container = document.getElementById('pagesWrapper');
-    
+    let longPressTimer = null;
+
     container.addEventListener('touchstart', (e) => {
-        // Don't track swipe if touching a slider
-        if (e.target.classList.contains('brightness-slider')) {
-            return;
-        }
+        if (e.target.classList.contains('brightness-slider')) return;
         touchStartX = e.touches[0].clientX;
+        longPressTimer = setTimeout(() => { openAdmin(); }, 2000);
+    }, { passive: true });
+
+    container.addEventListener('touchmove', () => {
+        if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
     }, { passive: true });
 
     container.addEventListener('touchend', (e) => {
-        // Don't handle swipe if it was a slider interaction
-        if (e.target.classList.contains('brightness-slider') || isSliderDragging) {
-            return;
-        }
+        if (longPressTimer) { clearTimeout(longPressTimer); longPressTimer = null; }
+        if (e.target.classList.contains('brightness-slider') || isSliderDragging) return;
         touchEndX = e.changedTouches[0].clientX;
         handleSwipe();
     }, { passive: true });
@@ -1863,14 +2010,24 @@ function exitScreensaver() {
     resetInactivityTimer();
 }
 
+function formatClockTime(date, formatOverride) {
+    const format = formatOverride || globalConfig?.screensaverTimeFormat;
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    if (format === '12h') {
+        const hours12 = date.getHours() % 12 || 12;
+        const ampm = date.getHours() < 12 ? 'AM' : 'PM';
+        return `${hours12}:${minutes} ${ampm}`;
+    }
+    const hours = String(date.getHours()).padStart(2, '0');
+    return `${hours}:${minutes}`;
+}
+
 function updateScreensaverClock() {
     const now = new Date();
-    
+
     // Time
-    const hours = String(now.getHours()).padStart(2, '0');
-    const minutes = String(now.getMinutes()).padStart(2, '0');
-    document.getElementById('screensaverTime').textContent = `${hours}:${minutes}`;
-    
+    document.getElementById('screensaverTime').textContent = formatClockTime(now);
+
     // Date
     const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
     const months = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
@@ -1922,25 +2079,7 @@ function updateScreensaverClock() {
     if (config.screensaverWeather && entityStates[config.screensaverWeather]) {
         const weatherState = entityStates[config.screensaverWeather];
         
-        const weatherIcons = {
-            'clear-night': 'nightlight',
-            'cloudy': 'cloud',
-            'fog': 'foggy',
-            'hail': 'weather_hail',
-            'lightning': 'thunderstorm',
-            'lightning-rainy': 'thunderstorm',
-            'partlycloudy': 'partly_cloudy_day',
-            'pouring': 'rainy_heavy',
-            'rainy': 'rainy',
-            'snowy': 'weather_snowy',
-            'snowy-rainy': 'weather_mix',
-            'sunny': 'sunny',
-            'windy': 'air',
-            'windy-variant': 'air',
-            'exceptional': 'warning'
-        };
-        
-        weatherIcon.textContent = weatherIcons[weatherState.state] || 'cloud';
+        weatherIcon.textContent = WEATHER_ICONS[weatherState.state] || 'cloud';
         
         // Show weather temperature
         if (weatherState.attributes.temperature !== undefined) {
@@ -1949,12 +2088,7 @@ function updateScreensaverClock() {
             weatherTemp.textContent = `${temp}${unit}`;
         }
         
-        // Format condition with spaces (partlycloudy -> partly cloudy)
-        const condition = weatherState.state
-            .replace(/-/g, ' ')
-            .replace(/([a-z])([A-Z])/g, '$1 $2')
-            .toLowerCase();
-        weatherCondition.textContent = condition;
+        weatherCondition.textContent = formatWeatherCondition(weatherState.state);
         weatherElement.style.display = 'flex';
     } else {
         weatherElement.style.display = 'none';
@@ -1981,9 +2115,9 @@ function setupInactivityDetection() {
 function openAdmin() {
     const panel = document.getElementById('adminPanel');
     panel.classList.add('active');
-    
-    if (config) {
-        // Already have an active room config, show room manager
+
+    // Show room selector if HA is already configured, initial setup only if not
+    if (config || (globalConfig && globalConfig.haToken)) {
         showRoomManager();
     } else if (globalConfig && globalConfig.haToken && roomConfigs.length > 0) {
         // Global config exists and rooms are configured, just need to pick a room
@@ -2023,7 +2157,11 @@ function showInitialSetup() {
 }
 
 function showRoomManager() {
+    setAdminParam('rooms');
     const panel = document.getElementById('adminPanel');
+    const hasRooms = roomConfigs.length > 0;
+    const activeIdx = config ? roomConfigs.findIndex(r => r.roomName === config.roomName) : -1;
+
     panel.innerHTML = `
         <div class="admin-header">
             <div class="admin-title">Room Configuration</div>
@@ -2032,27 +2170,49 @@ function showRoomManager() {
 
         <div class="error-message" id="errorMessage"></div>
 
+        ${!config && hasRooms ? `
+        <div style="background: rgba(99, 179, 237, 0.15); border: 1px solid rgba(99, 179, 237, 0.4); border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; color: rgba(255,255,255,0.85); font-size: 13px;">
+            Select a room for this panel to get started.
+        </div>` : ''}
+
         <div class="form-group">
-            <label class="form-label">Select Room</label>
-            <select class="form-input" id="roomSelect" onchange="loadSelectedRoom()">
+            <label class="form-label">Room</label>
+            <select class="form-input" id="roomSelect" onchange="updateRoomManagerButtons()">
                 <option value="">-- Select a room --</option>
-                ${roomConfigs.map((room, idx) => `<option value="${idx}" ${config && config.roomName === room.roomName ? 'selected' : ''}>${room.roomName}</option>`).join('')}
+                ${roomConfigs.map((room, idx) => `<option value="${idx}" ${idx === activeIdx ? 'selected' : ''}>${room.roomName}${idx === activeIdx ? ' (active)' : ''}</option>`).join('')}
             </select>
         </div>
 
-        <div style="display: flex; gap: 8px; margin-bottom: 24px;">
-            <button class="add-btn" style="flex: 1; margin-top: 0;" onclick="showRoomEditor('new')">+ New Room</button>
-            <button class="add-btn" style="flex: 1; margin-top: 0;" onclick="showRoomEditor('edit')" id="editRoomBtn" ${!config ? 'disabled' : ''}>Edit Current</button>
-            <button class="remove-btn" style="flex: 1;" onclick="deleteCurrentRoom()" id="deleteRoomBtn" ${!config ? 'disabled' : ''}>Delete</button>
+        <div style="display: flex; gap: 8px; margin-bottom: 8px;">
+            <button class="add-btn" style="flex: 1; margin-top: 0;" id="loadRoomBtn" onclick="loadSelectedRoom()" ${!hasRooms ? 'disabled' : ''}>Set Active</button>
+            <button class="add-btn" style="flex: 1; margin-top: 0;" id="editRoomBtn" onclick="editSelectedRoom()" ${!hasRooms ? 'disabled' : ''}>Edit</button>
+            <button class="remove-btn" style="flex: 1;" id="deleteRoomBtn" onclick="deleteSelectedRoom()" ${!hasRooms ? 'disabled' : ''}>Delete</button>
         </div>
 
-        <div style="border-top: 1px solid rgba(255, 255, 255, 0.1); padding-top: 20px; margin-top: 20px;">
+        <button class="add-btn" style="width: 100%; margin-bottom: 24px;" onclick="showRoomEditor('new')">+ New Room</button>
+
+        <div style="border-top: 1px solid rgba(255, 255, 255, 0.1); padding-top: 20px; margin-top: 4px;">
             <button class="save-btn" style="background: linear-gradient(135deg, #666 0%, #444 100%);" onclick="showGlobalSettings()">Global Settings</button>
         </div>
     `;
 }
 
+function updateRoomManagerButtons() {
+    const idx = parseInt(document.getElementById('roomSelect').value);
+    const hasSelection = !isNaN(idx) && idx >= 0;
+    document.getElementById('loadRoomBtn').disabled = !hasSelection;
+    document.getElementById('editRoomBtn').disabled = !hasSelection;
+    document.getElementById('deleteRoomBtn').disabled = !hasSelection;
+}
+
+function editSelectedRoom() {
+    const idx = parseInt(document.getElementById('roomSelect').value);
+    if (isNaN(idx) || !roomConfigs[idx]) return;
+    showRoomEditor('edit', idx);
+}
+
 function showGlobalSettings() {
+    setAdminParam('settings');
     const panel = document.getElementById('adminPanel');
     panel.innerHTML = `
         <div class="admin-header">
@@ -2062,74 +2222,149 @@ function showGlobalSettings() {
 
         <div class="error-message" id="errorMessage"></div>
 
-        <div class="form-group">
-            <label class="form-label">Home Assistant URL</label>
-            <input type="text" class="form-input" id="haUrlInput" placeholder="http://homeassistant.local:8123" value="${globalConfig.haUrl}">
-            <small style="color: #888; font-size: 12px;">Include http:// or https://</small>
+        <div class="settings-section">
+            <div class="settings-section-title">Home Assistant</div>
+            <div class="form-group">
+                <label class="form-label">URL</label>
+                <input type="text" class="form-input" id="haUrlInput" placeholder="http://homeassistant.local:8123" value="${globalConfig.haUrl}">
+                <small style="color: #888; font-size: 12px;">Include http:// or https://</small>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Long-Lived Access Token</label>
+                <input type="password" class="form-input" id="haTokenInput" placeholder="Your HA token" value="${globalConfig.haToken}">
+                <small style="color: #888; font-size: 12px;">Create in HA: Profile → Security → Long-Lived Access Tokens</small>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Google Assistant Entity (Optional)</label>
+                <input type="text" class="form-input" id="assistantEntityInput" placeholder="conversation.google_assistant" value="${globalConfig.assistantEntity || ''}">
+                <small style="color: #888; font-size: 12px;">For voice command tiles. Use conversation agent ID from HA.</small>
+            </div>
         </div>
 
-        <div class="form-group">
-            <label class="form-label">Long-Lived Access Token</label>
-            <input type="password" class="form-input" id="haTokenInput" placeholder="Your HA token" value="${globalConfig.haToken}">
-            <small style="color: #888; font-size: 12px;">Create in HA: Profile → Security → Long-Lived Access Tokens</small>
+        <div class="settings-section">
+            <div class="settings-section-title">Device</div>
+            <div class="form-group">
+                <label class="form-label">Model</label>
+                <select class="form-input" id="deviceModelInput">
+                    <option value="pro" ${(globalConfig.deviceModel || 'pro') === 'pro' ? 'selected' : ''}>NSPanel Pro (480×480)</option>
+                    <option value="pro120" ${globalConfig.deviceModel === 'pro120' ? 'selected' : ''}>NSPanel Pro 120 (480×890)</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Font Family</label>
+                <select class="form-input" id="fontFamilyInput">
+                    ${Object.keys(FONT_OPTIONS).map(name =>
+                        `<option value="${name}" ${(globalConfig.fontFamily || 'Inter') === name ? 'selected' : ''}>${name}</option>`
+                    ).join('')}
+                </select>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Header</label>
+                <select class="form-input" id="headerDisplayInput">
+                    <option value="full" ${!globalConfig.hideRoomName && !globalConfig.hideHeader ? 'selected' : ''}>Full</option>
+                    <option value="no-name" ${globalConfig.hideRoomName && !globalConfig.hideHeader ? 'selected' : ''}>Hide room name</option>
+                    <option value="hidden" ${globalConfig.hideHeader ? 'selected' : ''}>Hidden</option>
+                </select>
+            </div>
         </div>
 
-        <div class="form-group">
-            <label class="form-label">Google Assistant Entity (Optional)</label>
-            <input type="text" class="form-input" id="assistantEntityInput" placeholder="conversation.google_assistant" value="${globalConfig.assistantEntity || ''}">
-            <small style="color: #888; font-size: 12px;">For voice command tiles. Use conversation agent ID from HA.</small>
+        <div class="settings-section">
+            <div class="settings-section-title">Screensaver</div>
+            <div class="form-group">
+                <label class="form-label">Timeout (seconds)</label>
+                <input type="number" class="form-input" id="screensaverTimeoutInput" placeholder="10" min="5" max="300" value="${globalConfig.screensaverTimeout || 10}">
+                <small style="color: #888; font-size: 12px;">Time of inactivity before screensaver activates (5–300 seconds)</small>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Time Format</label>
+                <select class="form-input" id="screensaverTimeFormatInput">
+                    <option value="24h" ${(globalConfig.screensaverTimeFormat || '24h') === '24h' ? 'selected' : ''}>24-hour</option>
+                    <option value="12h" ${globalConfig.screensaverTimeFormat === '12h' ? 'selected' : ''}>12-hour (AM/PM)</option>
+                </select>
+                <small style="color: #888; font-size: 12px;">Also used by clock tiles</small>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Temperature Entity (Optional)</label>
+                <input type="text" class="form-input" id="screensaverTempEntityInput" placeholder="sensor.outdoor_temperature" value="${globalConfig.screensaverTempEntity || ''}">
+                <small style="color: #888; font-size: 12px;">Sensor shown on screensaver</small>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Weather Entity (Optional)</label>
+                <input type="text" class="form-input" id="screensaverWeatherEntityInput" placeholder="weather.home" value="${globalConfig.screensaverWeather || ''}">
+                <small style="color: #888; font-size: 12px;">Weather entity shown on screensaver</small>
+            </div>
+            <div class="form-group">
+                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                    <input type="checkbox" id="disableScreensaverInput" ${globalConfig.disableBuiltInScreensaver ? 'checked' : ''} style="width: 20px; height: 20px; cursor: pointer;">
+                    <span class="form-label" style="margin: 0;">Disable Built-in Screensaver</span>
+                </label>
+                <small style="color: #888; font-size: 12px; display: block; margin-top: 4px;">
+                    Use if you prefer Fully Kiosk's screensaver instead.<br>
+                    <strong>Standalone URL:</strong> <code style="background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px;">${window.location.origin}/?screensaver=true</code>
+                </small>
+            </div>
         </div>
 
-        <div class="form-group">
-            <label class="form-label">Screensaver Timeout (seconds)</label>
-            <input type="number" class="form-input" id="screensaverTimeoutInput" placeholder="10" min="5" max="300" value="${globalConfig.screensaverTimeout || 10}">
-            <small style="color: #888; font-size: 12px;">Time of inactivity before screensaver activates (5-300 seconds)</small>
-        </div>
-
-        <div class="form-group">
-            <label class="form-label">Screensaver Temperature Entity (Optional)</label>
-            <input type="text" class="form-input" id="screensaverTempEntityInput" placeholder="sensor.outdoor_temperature" value="${globalConfig.screensaverTempEntity || ''}">
-            <small style="color: #888; font-size: 12px;">Temperature sensor to show on screensaver (for standalone screensaver mode)</small>
-        </div>
-
-        <div class="form-group">
-            <label class="form-label">Screensaver Weather Entity (Optional)</label>
-            <input type="text" class="form-input" id="screensaverWeatherEntityInput" placeholder="weather.home" value="${globalConfig.screensaverWeather || ''}">
-            <small style="color: #888; font-size: 12px;">Weather entity to show on screensaver (for standalone screensaver mode)</small>
-        </div>
-
-        <div class="form-group">
-            <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
-                <input type="checkbox" id="disableScreensaverInput" ${globalConfig.disableBuiltInScreensaver ? 'checked' : ''} style="width: 20px; height: 20px; cursor: pointer;">
-                <span class="form-label" style="margin: 0;">Disable Built-in Screensaver</span>
-            </label>
-            <small style="color: #888; font-size: 12px; display: block; margin-top: 4px;">
-                Use this if you're using Fully Kiosk's screensaver feature instead.<br>
-                <strong>Standalone Screensaver URL:</strong> <code style="background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px;">${window.location.origin}/?screensaver=true</code>
-            </small>
-        </div>
-
-        <div class="form-group">
-            <label class="form-label">Test Sound</label>
-            <button class="add-btn" style="margin-top: 0;" onclick="testSound()">Play Test Sound</button>
-            <small style="color: #888; font-size: 12px; display: block; margin-top: 4px;">
-                Place a sound.mp3 file in the root directory to test audio playback on the panel
-            </small>
+        <div class="settings-section">
+            <div class="settings-section-title">Features</div>
+            <div class="form-group">
+                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                    <input type="checkbox" id="hideVoiceMessagesInput" ${globalConfig.hideVoiceMessages ? 'checked' : ''} style="width: 20px; height: 20px; cursor: pointer;">
+                    <span class="form-label" style="margin: 0;">Hide Voice Messages</span>
+                </label>
+                <small style="color: #888; font-size: 12px; display: block; margin-top: 4px;">Hides the phone button from the header</small>
+            </div>
+            <div class="form-group">
+                <label class="form-label">Test Sound</label>
+                <button class="add-btn" style="margin-top: 0;" onclick="testSound()">Play Test Sound</button>
+                <small style="color: #888; font-size: 12px; display: block; margin-top: 4px;">Place a sound.mp3 in the root directory to test audio playback</small>
+            </div>
         </div>
 
         <button class="save-btn" onclick="saveGlobalSettings()">Save Global Settings</button>
     `;
 }
 
-function showRoomEditor(mode) {
+let roomEditorSnapshot = null;
+
+function getRoomEditorCurrentState() {
+    return {
+        roomName: document.getElementById('roomNameInput')?.value.trim() || '',
+        headerTempEntity: document.getElementById('headerTempEntityInput')?.value.trim() || '',
+        screensaverWeather: document.getElementById('screensaverWeatherInput')?.value.trim() || '',
+        gridColumns: parseInt(document.getElementById('gridColumnsInput')?.value) || 2,
+        gridRows: parseInt(document.getElementById('gridRowsInput')?.value) || 2,
+        entities: window.editingRoomData?.entities || [],
+        assistantCommands: window.editingRoomData?.assistantCommands || [],
+        spotifyPlaylists: window.editingRoomData?.spotifyPlaylists || [],
+    };
+}
+
+function backFromRoomEditor() {
+    if (roomEditorSnapshot !== null) {
+        const current = JSON.stringify(getRoomEditorCurrentState());
+        if (current !== roomEditorSnapshot) {
+            if (!confirm('You have unsaved changes. Discard them?')) return;
+        }
+    }
+    roomEditorSnapshot = null;
+    showRoomManager();
+}
+
+function showRoomEditor(mode, roomIdx) {
+    const roomName = roomIdx !== undefined && roomConfigs[roomIdx] ? roomConfigs[roomIdx].roomName : undefined;
+    setAdminParam('editor', { mode, room: roomName });
     const isEdit = mode === 'edit';
-    const roomData = isEdit && config ? config : { ...DEFAULT_ROOM_CONFIG };
+    window.editingRoomIdx = isEdit && roomIdx !== undefined ? roomIdx : null;
+    const roomData = isEdit && roomIdx !== undefined && roomConfigs[roomIdx]
+        ? roomConfigs[roomIdx]
+        : (isEdit && config ? config : { ...DEFAULT_ROOM_CONFIG });
     
     const panel = document.getElementById('adminPanel');
     panel.innerHTML = `
         <div class="admin-header">
             <div class="admin-title">${isEdit ? 'Edit' : 'New'} Room</div>
-            <button class="close-btn" onclick="showRoomManager()">Back</button>
+            <button class="close-btn" onclick="backFromRoomEditor()">Back</button>
         </div>
 
         <div class="error-message" id="errorMessage"></div>
@@ -2158,6 +2393,8 @@ function showRoomEditor(mode) {
                         <option value="2" ${(roomData.gridRows || 2) === 2 ? 'selected' : ''}>2</option>
                         <option value="3" ${(roomData.gridRows || 2) === 3 ? 'selected' : ''}>3</option>
                         <option value="4" ${(roomData.gridRows || 2) === 4 ? 'selected' : ''}>4</option>
+                        <option value="5" ${(roomData.gridRows || 2) === 5 ? 'selected' : ''}>5</option>
+                        <option value="6" ${(roomData.gridRows || 2) === 6 ? 'selected' : ''}>6</option>
                     </select>
                 </div>
             </div>
@@ -2179,25 +2416,7 @@ function showRoomEditor(mode) {
         <div class="form-group">
             <label class="form-label">Entities</label>
             <div class="entity-list" id="entityList"></div>
-            <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 12px;">
-                <div style="display: flex; gap: 8px;">
-                    <input type="text" class="form-input" id="newEntityId" placeholder="light.living_room" style="flex: 2;">
-                    <input type="text" class="form-input" id="newEntityLabel" placeholder="Living Room" style="flex: 2;">
-                </div>
-                <div style="display: flex; gap: 8px; align-items: center;">
-                    <label class="form-label" style="margin: 0; min-width: 40px;">Icon:</label>
-                    <button onclick="openIconPicker()" id="iconPickerButton" style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.15); color: rgba(255,255,255,0.7); padding: 12px 20px; border-radius: 8px; cursor: pointer; font-family: 'Material Symbols Outlined'; font-size: 24px; display: flex; align-items: center; gap: 8px; flex: 1;">
-                        <span id="selectedIconPreview">search</span>
-                        <span id="selectedIconName" style="font-family: 'Inter', sans-serif; font-size: 12px; color: rgba(255,255,255,0.5);">Choose icon</span>
-                    </button>
-                    <input type="hidden" id="newEntityIcon" value="">
-                </div>
-                <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; padding: 8px 0;">
-                    <input type="checkbox" id="newEntityHideState" style="width: 18px; height: 18px; cursor: pointer;">
-                    <span style="font-size: 12px; color: #888;">Hide state text on tile</span>
-                </label>
-            </div>
-            <button class="add-btn" onclick="addEntity()">+ Add Entity</button>
+            <button class="add-btn" onclick="openEntityModal(null)">+ Add Entity</button>
         </div>
 
         <div class="form-group">
@@ -2238,6 +2457,7 @@ function showRoomEditor(mode) {
     roomData.entities.forEach((entity, index) => {
         const item = document.createElement('div');
         item.className = 'entity-item';
+        const displayLabel = entity.label || (entity.id.startsWith('clock.') ? 'Clock' : entity.id);
         item.innerHTML = `
             <div style="display: flex; gap: 8px; align-items: center;">
                 <div style="display: flex; flex-direction: column; gap: 4px;">
@@ -2245,12 +2465,12 @@ function showRoomEditor(mode) {
                     <button class="reorder-btn" onclick="moveEntityDown(${index})" ${index === roomData.entities.length - 1 ? 'disabled' : ''}>arrow_downward</button>
                 </div>
                 <div>
-                    <strong>${entity.label}</strong><br>
+                    <strong>${displayLabel}</strong><br>
                     <small style="color: #888;">${entity.id}</small>
                 </div>
             </div>
             <div style="display: flex; gap: 8px;">
-                <button class="edit-btn" onclick="editEntity(${index})">edit</button>
+                <button class="edit-btn" onclick="openEntityModal(${index})">edit</button>
                 <button class="remove-btn" onclick="removeEntity(${index})">Remove</button>
             </div>
         `;
@@ -2312,6 +2532,17 @@ function showRoomEditor(mode) {
 
     // Store current editing data
     window.editingRoomData = roomData;
+    editingEntityIndex = null;
+    roomEditorSnapshot = JSON.stringify({
+        roomName: roomData.roomName || '',
+        headerTempEntity: roomData.headerTempEntity || '',
+        screensaverWeather: roomData.screensaverWeather || '',
+        gridColumns: roomData.gridColumns || 2,
+        gridRows: roomData.gridRows || 2,
+        entities: roomData.entities || [],
+        assistantCommands: roomData.assistantCommands || [],
+        spotifyPlaylists: roomData.spotifyPlaylists || [],
+    });
 }
 
 async function loadSelectedRoom() {
@@ -2353,8 +2584,15 @@ async function saveGlobalSettings() {
     globalConfig.haUrl = document.getElementById('haUrlInput').value.trim().replace(/\/$/, '');
     globalConfig.haToken = document.getElementById('haTokenInput').value.trim();
     globalConfig.assistantEntity = document.getElementById('assistantEntityInput').value.trim();
+    globalConfig.fontFamily = document.getElementById('fontFamilyInput').value;
+    globalConfig.deviceModel = document.getElementById('deviceModelInput').value;
+    globalConfig.hideVoiceMessages = document.getElementById('hideVoiceMessagesInput').checked;
     globalConfig.disableBuiltInScreensaver = document.getElementById('disableScreensaverInput').checked;
+    const headerDisplay = document.getElementById('headerDisplayInput').value;
+    globalConfig.hideRoomName = headerDisplay === 'no-name';
+    globalConfig.hideHeader = headerDisplay === 'hidden';
     globalConfig.screensaverTimeout = parseInt(document.getElementById('screensaverTimeoutInput').value) || 10;
+    globalConfig.screensaverTimeFormat = document.getElementById('screensaverTimeFormatInput').value;
     globalConfig.screensaverTempEntity = document.getElementById('screensaverTempEntityInput').value.trim();
     globalConfig.screensaverWeather = document.getElementById('screensaverWeatherEntityInput').value.trim();
 
@@ -2377,6 +2615,11 @@ async function saveGlobalSettings() {
         config.disableBuiltInScreensaver = globalConfig.disableBuiltInScreensaver;
         config.screensaverTimeout = globalConfig.screensaverTimeout;
     }
+
+    applyFontFamily();
+    applyDeviceModel();
+    applyVoiceMessageVisibility();
+    applyHeaderVisibility();
 
     // Test connection
     const states = await getStates();
@@ -2424,15 +2667,19 @@ async function saveRoom(mode) {
         }
         roomConfigs.push(roomConfig);
     } else {
-        // Update existing room
-        const idx = roomConfigs.findIndex(r => r.roomName === config.roomName);
+        // Update existing room by index, fall back to name match
+        const idx = window.editingRoomIdx !== null && window.editingRoomIdx !== undefined
+            ? window.editingRoomIdx
+            : roomConfigs.findIndex(r => r.roomName === (config ? config.roomName : roomName));
         if (idx >= 0) {
             roomConfigs[idx] = roomConfig;
         }
     }
 
     await saveRoomConfigs();
-    
+
+    roomEditorSnapshot = null;
+
     // Set as active room
     config = { ...globalConfig, ...roomConfig };
     await saveConfig();
@@ -2446,21 +2693,22 @@ async function saveRoom(mode) {
     }
 }
 
-async function deleteCurrentRoom() {
-    if (!config || !confirm(`Delete room "${config.roomName}"?`)) return;
-    
+async function deleteSelectedRoom() {
+    const idx = parseInt(document.getElementById('roomSelect').value);
+    if (isNaN(idx) || !roomConfigs[idx]) return;
+    const room = roomConfigs[idx];
+    if (!confirm(`Delete room "${room.roomName}"?`)) return;
+
     try {
-        // Delete from server
-        await fetch(`/config-api.php?path=room&name=${encodeURIComponent(config.roomName)}`, {
+        await fetch(`/config-api.php?path=room&name=${encodeURIComponent(room.roomName)}`, {
             method: 'DELETE'
         });
-        
-        // Reload room configs
+
         roomConfigs = await loadRoomConfigs();
-        
-        // Clear active room
-        config = null;
-        
+
+        // Clear active room if it was the deleted one
+        if (config && config.roomName === room.roomName) config = null;
+
         showRoomManager();
     } catch (error) {
         console.error('Failed to delete room:', error);
@@ -2468,57 +2716,196 @@ async function deleteCurrentRoom() {
     }
 }
 
-function closeAdmin() {
-    document.getElementById('adminPanel').classList.remove('active');
+function setAdminParam(view, extra = {}) {
+    const params = new URLSearchParams(window.location.search);
+    params.set('admin', view);
+    Object.entries(extra).forEach(([k, v]) => { if (v !== undefined) params.set(k, v); });
+    ['mode', 'room'].forEach(k => { if (!(k in extra) || extra[k] === undefined) params.delete(k); });
+    history.replaceState(null, '', '?' + params.toString());
 }
 
-function addEntity() {
-    const id = document.getElementById('newEntityId').value.trim();
+function clearAdminParam() {
+    const params = new URLSearchParams(window.location.search);
+    params.delete('admin');
+    params.delete('mode');
+    params.delete('room');
+    const qs = params.toString();
+    history.replaceState(null, '', qs ? '?' + qs : window.location.pathname);
+}
+
+function closeAdmin() {
+    document.getElementById('adminPanel').classList.remove('active');
+    clearAdminParam();
+}
+
+let editingEntityIndex = null;
+
+function updateEntityFormForDomain() {
+    const domain = document.getElementById('newEntityDomain').value;
+    const isClock = domain === 'clock';
+    document.getElementById('entityOptEntityId').style.display = isClock ? 'none' : 'flex';
+    document.getElementById('entityOptLabel').style.display = isClock ? 'none' : 'flex';
+    document.getElementById('entityOptIcon').style.display = isClock ? 'none' : 'flex';
+    document.getElementById('entityOptHideState').style.display = (domain === 'weather' || isClock) ? 'none' : 'block';
+    document.getElementById('entityOptDisableAction').style.display = isClock ? 'none' : 'block';
+    document.getElementById('entityOptLight').style.display = domain === 'light' ? 'block' : 'none';
+    document.getElementById('entityOptSensor').style.display = domain === 'sensor' ? 'flex' : 'none';
+    document.getElementById('entityOptWeather').style.display = domain === 'weather' ? 'flex' : 'none';
+    document.getElementById('entityOptClock').style.display = isClock ? 'flex' : 'none';
+
+    // Inline forecast needs vertical room, so it's unavailable on half-height tiles
+    const isHalfHeight = document.getElementById('newEntityTileHeight').value === 'half';
+    const inlineForecastCheckbox = document.getElementById('newEntityShowInlineForecast');
+    inlineForecastCheckbox.disabled = isHalfHeight;
+    if (isHalfHeight) inlineForecastCheckbox.checked = false;
+    const inlineForecastLabel = inlineForecastCheckbox.closest('label');
+    inlineForecastLabel.style.opacity = isHalfHeight ? '0.4' : '1';
+    inlineForecastLabel.style.cursor = isHalfHeight ? 'default' : 'pointer';
+
+    const tileForecastTypeSelect = document.getElementById('newEntityTileForecastType');
+    tileForecastTypeSelect.disabled = isHalfHeight;
+    tileForecastTypeSelect.style.opacity = isHalfHeight ? '0.4' : '1';
+}
+
+function openEntityModal(index) {
+    editingEntityIndex = index;
+    document.getElementById('entityEditorTitle').textContent = index === null ? 'Add Entity' : 'Edit Entity';
+
+    if (index !== null && window.editingRoomData?.entities[index]) {
+        const entity = window.editingRoomData.entities[index];
+        const dotIndex = entity.id.indexOf('.');
+        const domain = dotIndex !== -1 ? entity.id.substring(0, dotIndex) : 'light';
+        const rawId = dotIndex !== -1 ? entity.id.substring(dotIndex + 1) : entity.id;
+
+        document.getElementById('newEntityDomain').value = domain;
+        document.getElementById('newEntityId').value = rawId;
+        document.getElementById('newEntityLabel').value = entity.label || '';
+        document.getElementById('newEntityIcon').value = entity.icon || '';
+        document.getElementById('selectedIconPreview').textContent = entity.icon || 'search';
+        document.getElementById('selectedIconName').textContent = entity.icon || 'Choose icon';
+        document.getElementById('newEntityHideState').checked = entity.hideState || false;
+        document.getElementById('newEntityDisableAction').checked = entity.disableAction || false;
+        document.getElementById('newEntityDisableDimming').checked = entity.disableDimming || false;
+        document.getElementById('newEntityDecimals').value = entity.decimals !== undefined ? entity.decimals : '';
+        document.getElementById('newEntityHideWeatherName').checked = entity.hideWeatherName || false;
+        document.getElementById('newEntityHideWeatherIcon').checked = entity.hideWeatherIcon || false;
+        document.getElementById('newEntityHideWeatherForecast').checked = entity.hideWeatherForecast || false;
+        document.getElementById('newEntityShowInlineForecast').checked = entity.showInlineForecast || false;
+        document.getElementById('newEntityModalForecastType').value = entity.modalForecastType || 'hourly';
+        document.getElementById('newEntityTileForecastType').value = entity.tileForecastType || 'daily';
+        document.getElementById('newEntityTileHeight').value = entity.tileHeight || 'normal';
+        document.getElementById('newEntityHideClockDate').checked = entity.hideClockDate || false;
+        document.getElementById('newEntityClockFormat').value = entity.clockTimeFormat || '';
+    } else {
+        document.getElementById('newEntityDomain').value = 'light';
+        document.getElementById('newEntityId').value = '';
+        document.getElementById('newEntityLabel').value = '';
+        document.getElementById('newEntityIcon').value = '';
+        document.getElementById('selectedIconPreview').textContent = 'search';
+        document.getElementById('selectedIconName').textContent = 'Choose icon';
+        document.getElementById('newEntityHideState').checked = false;
+        document.getElementById('newEntityDisableAction').checked = false;
+        document.getElementById('newEntityDisableDimming').checked = false;
+        document.getElementById('newEntityDecimals').value = '';
+        document.getElementById('newEntityHideWeatherName').checked = false;
+        document.getElementById('newEntityHideWeatherIcon').checked = false;
+        document.getElementById('newEntityHideWeatherForecast').checked = false;
+        document.getElementById('newEntityShowInlineForecast').checked = false;
+        document.getElementById('newEntityModalForecastType').value = 'hourly';
+        document.getElementById('newEntityTileForecastType').value = 'daily';
+        document.getElementById('newEntityTileHeight').value = 'normal';
+        document.getElementById('newEntityHideClockDate').checked = false;
+        document.getElementById('newEntityClockFormat').value = '';
+    }
+
+    // Populate width options based on current room column count
+    const gridCols = parseInt(document.getElementById('gridColumnsInput')?.value) || window.editingRoomData?.gridColumns || 2;
+    const tileWidthSelect = document.getElementById('newEntityTileWidth');
+    tileWidthSelect.innerHTML = '';
+    for (let c = 1; c <= gridCols; c++) {
+        const opt = document.createElement('option');
+        opt.value = c;
+        opt.textContent = c === 1 ? '1 col' : c === gridCols ? `${c} cols (full width)` : `${c} cols`;
+        tileWidthSelect.appendChild(opt);
+    }
+    const savedColSpan = (editingEntityIndex !== null && window.editingRoomData?.entities[editingEntityIndex]?.tileColSpan) || 1;
+    tileWidthSelect.value = Math.min(savedColSpan, gridCols);
+
+    updateEntityFormForDomain();
+    document.getElementById('entityEditorModal').classList.add('active');
+    setTimeout(() => document.getElementById('newEntityLabel').focus(), 50);
+}
+
+function closeEntityModal(event) {
+    if (event && !event.currentTarget.id === 'entityEditorModal') return;
+    document.getElementById('entityEditorModal').classList.remove('active');
+    editingEntityIndex = null;
+}
+
+function saveEntityModal() {
+    const domain = document.getElementById('newEntityDomain').value;
+    let rawId = document.getElementById('newEntityId').value.trim();
     const label = document.getElementById('newEntityLabel').value.trim();
     const icon = document.getElementById('newEntityIcon').value.trim();
     const hideState = document.getElementById('newEntityHideState').checked;
 
-    if (!id || !label) {
+    if (domain === 'clock') {
+        if (!rawId) rawId = `clock_${Date.now()}`;
+    } else if (!rawId || !label) {
         showError('Please enter both entity ID and label');
         return;
     }
-
-    if (!window.editingRoomData) {
-        window.editingRoomData = { entities: [] };
+    if (rawId.includes('.')) {
+        showError('Enter only the ID without the domain (e.g. "living_room", not "light.living_room")');
+        return;
     }
 
-    const entity = { id, label };
+    if (!window.editingRoomData) window.editingRoomData = { entities: [] };
+
+    const entity = { id: `${domain}.${rawId}` };
+    if (label) entity.label = label;
     if (icon) entity.icon = icon;
     if (hideState) entity.hideState = true;
+    if (document.getElementById('newEntityDisableAction').checked) entity.disableAction = true;
+    if (domain === 'light' && document.getElementById('newEntityDisableDimming').checked) entity.disableDimming = true;
+    if (domain === 'sensor') {
+        const decimalsRaw = document.getElementById('newEntityDecimals').value;
+        if (decimalsRaw !== '') entity.decimals = parseInt(decimalsRaw);
+    }
+    if (domain === 'clock') {
+        if (document.getElementById('newEntityHideClockDate').checked) entity.hideClockDate = true;
+        const clockFormat = document.getElementById('newEntityClockFormat').value;
+        if (clockFormat) entity.clockTimeFormat = clockFormat;
+    }
+    if (domain === 'weather') {
+        if (document.getElementById('newEntityHideWeatherName').checked) entity.hideWeatherName = true;
+        if (document.getElementById('newEntityHideWeatherIcon').checked) entity.hideWeatherIcon = true;
+        if (document.getElementById('newEntityHideWeatherForecast').checked) entity.hideWeatherForecast = true;
+        if (document.getElementById('newEntityShowInlineForecast').checked) entity.showInlineForecast = true;
+        const modalForecastType = document.getElementById('newEntityModalForecastType').value;
+        if (modalForecastType && modalForecastType !== 'hourly') entity.modalForecastType = modalForecastType;
+        const tileForecastType = document.getElementById('newEntityTileForecastType').value;
+        if (tileForecastType && tileForecastType !== 'daily') entity.tileForecastType = tileForecastType;
+    }
 
-    window.editingRoomData.entities.push(entity);
-    document.getElementById('newEntityId').value = '';
-    document.getElementById('newEntityLabel').value = '';
-    document.getElementById('newEntityIcon').value = '';
-    document.getElementById('selectedIconPreview').textContent = 'search';
-    document.getElementById('selectedIconName').textContent = 'Choose icon';
-    document.getElementById('newEntityHideState').checked = false;
-    
-    refreshEntityList();
-}
+    const tileColSpan = parseInt(document.getElementById('newEntityTileWidth').value);
+    const tileHeight = document.getElementById('newEntityTileHeight').value;
+    if (tileColSpan && tileColSpan > 1) entity.tileColSpan = tileColSpan;
+    if (tileHeight && tileHeight !== 'normal') entity.tileHeight = tileHeight;
+    if (tileHeight === 'half') {
+        delete entity.showInlineForecast;
+        delete entity.tileForecastType;
+    }
 
-function editEntity(index) {
-    if (!window.editingRoomData || !window.editingRoomData.entities[index]) return;
-    
-    const entity = window.editingRoomData.entities[index];
-    document.getElementById('newEntityId').value = entity.id;
-    document.getElementById('newEntityLabel').value = entity.label;
-    document.getElementById('newEntityIcon').value = entity.icon || '';
-    document.getElementById('selectedIconPreview').textContent = entity.icon || 'search';
-    document.getElementById('selectedIconName').textContent = entity.icon || 'Choose icon';
-    document.getElementById('newEntityHideState').checked = entity.hideState || false;
-    
-    // Remove the entity so it can be re-added with new values
-    window.editingRoomData.entities.splice(index, 1);
+    if (editingEntityIndex !== null) {
+        window.editingRoomData.entities.splice(editingEntityIndex, 1, entity);
+    } else {
+        window.editingRoomData.entities.push(entity);
+    }
+
+    document.getElementById('entityEditorModal').classList.remove('active');
+    editingEntityIndex = null;
     refreshEntityList();
-    
-    // Focus on label input
-    document.getElementById('newEntityLabel').focus();
 }
 
 function removeEntity(index) {
@@ -2534,10 +2921,11 @@ function refreshEntityList() {
     window.editingRoomData.entities.forEach((entity, idx) => {
         const item = document.createElement('div');
         item.className = 'entity-item';
-        
+
         const iconText = entity.icon ? `<span style="font-family: 'Material Symbols Outlined'; font-size: 14px; color: #42a5f5; margin-right: 4px;">${entity.icon}</span>` : '';
         const hideStateText = entity.hideState ? '<span style="font-size: 10px; color: #888; margin-left: 8px;">[Hidden]</span>' : '';
-        
+        const displayLabel = entity.label || (entity.id.startsWith('clock.') ? 'Clock' : entity.id);
+
         item.innerHTML = `
             <div style="display: flex; gap: 8px; align-items: center;">
                 <div style="display: flex; flex-direction: column; gap: 4px;">
@@ -2545,12 +2933,12 @@ function refreshEntityList() {
                     <button class="reorder-btn" onclick="moveEntityDown(${idx})" ${idx === window.editingRoomData.entities.length - 1 ? 'disabled' : ''}>arrow_downward</button>
                 </div>
                 <div>
-                    <div>${iconText}<strong>${entity.label}</strong>${hideStateText}</div>
+                    <div>${iconText}<strong>${displayLabel}</strong>${hideStateText}</div>
                     <small style="color: #888;">${entity.id}</small>
                 </div>
             </div>
             <div style="display: flex; gap: 8px;">
-                <button class="edit-btn" onclick="editEntity(${idx})">edit</button>
+                <button class="edit-btn" onclick="openEntityModal(${idx})">edit</button>
                 <button class="remove-btn" onclick="removeEntity(${idx})">Remove</button>
             </div>
         `;
@@ -2803,7 +3191,7 @@ function openClimateModal(entityId) {
     hvacModes.forEach(mode => {
         const btn = document.createElement('button');
         btn.className = 'climate-mode-btn';
-        btn.textContent = mode;
+        btn.textContent = mode === 'heat_cool' ? 'heat/cool' : mode;
         
         if (mode === currentMode) {
             btn.classList.add('active', mode);
@@ -2873,31 +3261,58 @@ async function setClimateMode(entityId, mode) {
 // ============================================
 // WEATHER FORECAST MODAL
 // ============================================
+function renderInlineForecastStrip(tile, forecast, forecastType = 'daily') {
+    const existing = tile.querySelector('.weather-forecast-strip');
+    if (existing) existing.remove();
+    const strip = document.createElement('div');
+    strip.className = 'weather-forecast-strip';
+    forecast.slice(0, 4).forEach(period => {
+        const dt = new Date(period.datetime);
+        const label = forecastType === 'hourly'
+            ? dt.toLocaleTimeString('en', { hour: 'numeric' })
+            : dt.toLocaleDateString('en', { weekday: 'short' });
+        const icon = WEATHER_ICONS[period.condition] || 'cloud';
+        const temp = period.temperature !== undefined ? `${Math.round(period.temperature)}°` : '—';
+        const item = document.createElement('div');
+        item.className = 'weather-forecast-item';
+        item.innerHTML = `
+            <span class="material-symbols-outlined weather-forecast-icon">${icon}</span>
+            <span class="weather-forecast-day">${label}</span>
+            <span class="weather-forecast-temp">${temp}</span>
+        `;
+        strip.appendChild(item);
+    });
+    tile.appendChild(strip);
+}
+
+async function fetchInlineForecast(entityId, forecastType = 'daily') {
+    try {
+        const response = await callHA('services/weather/get_forecasts?return_response=true', 'POST', {
+            entity_id: entityId,
+            type: forecastType
+        });
+        let data = [];
+        if (response.service_response?.[entityId]?.forecast) data = response.service_response[entityId].forecast;
+        else if (response[entityId]?.forecast) data = response[entityId].forecast;
+        else if (response.forecast) data = response.forecast;
+        else if (Array.isArray(response)) data = response;
+
+        if (data.length > 0) {
+            forecastCache[entityId] = { type: forecastType, data };
+            const liveTile = document.querySelector(`[data-entity-id="${entityId}"]`);
+            if (liveTile) renderInlineForecastStrip(liveTile, data, forecastType);
+        }
+    } catch (e) {
+        // Forecast unavailable — strip stays hidden
+    }
+}
+
 async function openWeatherForecast(entityId) {
     const state = entityStates[entityId];
     if (!state) return;
     
     const modal = document.getElementById('weatherModal');
     const entity = config.entities.find(e => e.id === entityId);
-    
-    // Weather icon mapping
-    const weatherIcons = {
-        'clear-night': 'nightlight',
-        'cloudy': 'cloud',
-        'fog': 'foggy',
-        'hail': 'weather_hail',
-        'lightning': 'thunderstorm',
-        'lightning-rainy': 'thunderstorm',
-        'partlycloudy': 'partly_cloudy_day',
-        'pouring': 'rainy_heavy',
-        'rainy': 'rainy',
-        'snowy': 'weather_snowy',
-        'snowy-rainy': 'weather_mix',
-        'sunny': 'sunny',
-        'windy': 'air',
-        'windy-variant': 'air',
-        'exceptional': 'warning'
-    };
     
     // Update modal title
     document.getElementById('weatherModalTitle').textContent = entity ? entity.label : 'Weather';
@@ -2906,8 +3321,8 @@ async function openWeatherForecast(entityId) {
     const currentWeather = document.getElementById('weatherCurrent');
     const temp = state.attributes.temperature;
     const unit = state.attributes.temperature_unit || '°C';
-    const condition = state.state.replace('-', ' ');
-    const icon = weatherIcons[state.state] || 'cloud';
+    const condition = formatWeatherCondition(state.state);
+    const icon = WEATHER_ICONS[state.state] || 'cloud';
     
     currentWeather.innerHTML = `
         <div class="weather-current-icon">${icon}</div>
@@ -2922,12 +3337,14 @@ async function openWeatherForecast(entityId) {
     forecastList.innerHTML = '<div style="text-align: center; padding: 20px; color: rgba(255, 255, 255, 0.5);">Loading forecast...</div>';
     
     modal.classList.add('active');
-    
+
+    const modalForecastType = entity?.modalForecastType || 'hourly';
+
     // Fetch forecast data using weather.get_forecasts service
     try {
         const forecastResponse = await callHA('services/weather/get_forecasts?return_response=true', 'POST', {
             entity_id: entityId,
-            type: 'hourly'
+            type: modalForecastType
         });
         
         console.log('Forecast response:', forecastResponse);
@@ -2966,30 +3383,34 @@ async function openWeatherForecast(entityId) {
             forecastData.slice(0, 5).forEach(item => {
                 const forecastItem = document.createElement('div');
                 forecastItem.className = 'weather-forecast-item';
-                
+
                 // Format datetime
                 const date = new Date(item.datetime);
                 const now = new Date();
                 const isToday = date.toDateString() === now.toDateString();
                 const isTomorrow = date.toDateString() === new Date(now.getTime() + 86400000).toDateString();
-                
+                const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
                 let timeStr;
-                if (isToday) {
+                if (modalForecastType === 'daily') {
+                    timeStr = isToday ? 'Today' : isTomorrow ? 'Tomorrow' : days[date.getDay()];
+                } else if (isToday) {
                     timeStr = `Today ${date.getHours()}:00`;
                 } else if (isTomorrow) {
                     timeStr = `Tomorrow ${date.getHours()}:00`;
                 } else {
-                    const days = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
                     timeStr = `${days[date.getDay()]} ${date.getHours()}:00`;
                 }
-                
-                const forecastIcon = weatherIcons[item.condition] || 'cloud';
-                const forecastTemp = Math.round(item.temperature);
-                
+
+                const forecastIcon = WEATHER_ICONS[item.condition] || 'cloud';
+                const forecastTemp = modalForecastType === 'daily' && item.templow !== undefined
+                    ? `${Math.round(item.temperature)}° / ${Math.round(item.templow)}°`
+                    : `${Math.round(item.temperature)}${unit}`;
+
                 forecastItem.innerHTML = `
                     <div class="weather-forecast-time">${timeStr}</div>
                     <div class="weather-forecast-icon">${forecastIcon}</div>
-                    <div class="weather-forecast-temp">${forecastTemp}${unit}</div>
+                    <div class="weather-forecast-temp">${forecastTemp}</div>
                 `;
                 
                 forecastList.appendChild(forecastItem);
@@ -3033,6 +3454,16 @@ function startPolling() {
 // ============================================
 // INITIALIZATION
 // ============================================
+
+window.addEventListener('beforeunload', (e) => {
+    if (roomEditorSnapshot === null) return;
+    const current = JSON.stringify(getRoomEditorCurrentState());
+    if (current !== roomEditorSnapshot) {
+        e.preventDefault();
+        e.returnValue = '';
+    }
+});
+
 async function init() {
     setupTouchHandlers();
     
@@ -3040,6 +3471,11 @@ async function init() {
     const urlParams = new URLSearchParams(window.location.search);
     const hashParams = window.location.hash;
     const isScreensaverMode = urlParams.get('screensaver') === 'true' || hashParams === '#screensaver';
+
+    if (urlParams.get('debug') === 'true') {
+        document.getElementById('debugEditBtn').style.display = 'flex';
+        document.getElementById('debugSettingsBtn').style.display = 'flex';
+    }
     
     if (isScreensaverMode) {
         // Screensaver-only mode - works without room config
@@ -3084,6 +3520,42 @@ async function init() {
     globalConfig = await loadGlobalConfig();
     roomConfigs = await loadRoomConfigs();
     
+    applyFontFamily();
+    applyDeviceModel();
+    applyVoiceMessageVisibility();
+    applyHeaderVisibility();
+
+    // Override active room from URL param (enables shareable room URLs)
+    const adminView = urlParams.get('admin');
+    const roomParam = urlParams.get('room');
+    if (roomParam && !adminView) {
+        const idx = roomConfigs.findIndex(r => r.roomName === roomParam);
+        if (idx >= 0) config = { ...globalConfig, ...roomConfigs[idx] };
+    }
+
+    // Restore admin view from URL params on reload
+    if (adminView && (config || globalConfig.haToken)) {
+        document.getElementById('adminPanel').classList.add('active');
+        if (adminView === 'settings') {
+            showGlobalSettings();
+        } else if (adminView === 'editor') {
+            const editorMode = urlParams.get('mode') || 'edit';
+            const editorRoomParam = urlParams.get('room');
+            const editorRoomIdx = editorRoomParam ? roomConfigs.findIndex(r => r.roomName === editorRoomParam) : -1;
+            showRoomEditor(editorMode, editorRoomIdx >= 0 ? editorRoomIdx : undefined);
+        } else {
+            showRoomManager();
+        }
+        return;
+    }
+
+    // Set frontend room param so reload returns to the same room
+    if (config) {
+        const params = new URLSearchParams(window.location.search);
+        params.set('room', config.roomName);
+        history.replaceState(null, '', '?' + params.toString());
+    }
+
     // Normal mode - setup inactivity screensaver only if not disabled
     if (!globalConfig.disableBuiltInScreensaver) {
         setupInactivityDetection();
@@ -3146,25 +3618,34 @@ const COMMON_ICONS = [
 
 function openIconPicker() {
     const modal = document.getElementById('iconPickerModal');
-    const grid = document.getElementById('iconGrid');
     const searchInput = document.getElementById('iconSearchInput');
-    
-    // Render all icons
+    const customInput = document.getElementById('iconCustomInput');
+    const customPreview = document.getElementById('iconCustomPreview');
+
     renderIconGrid(COMMON_ICONS);
-    
-    // Setup search
+
     searchInput.value = '';
     searchInput.oninput = (e) => {
         const query = e.target.value.toLowerCase();
-        if (query) {
-            const filtered = COMMON_ICONS.filter(icon => icon.includes(query));
-            renderIconGrid(filtered);
-        } else {
-            renderIconGrid(COMMON_ICONS);
-        }
+        renderIconGrid(query ? COMMON_ICONS.filter(icon => icon.includes(query)) : COMMON_ICONS);
     };
-    
+
+    customInput.value = '';
+    customPreview.textContent = '';
+    customInput.oninput = (e) => {
+        customPreview.textContent = e.target.value.trim();
+    };
+    customInput.onkeydown = (e) => {
+        if (e.key === 'Enter') selectCustomIcon();
+    };
+
     modal.classList.add('active');
+    setTimeout(() => searchInput.focus(), 50);
+}
+
+function selectCustomIcon() {
+    const name = document.getElementById('iconCustomInput').value.trim();
+    if (name) selectIcon(name);
 }
 
 function renderIconGrid(icons) {
@@ -3243,6 +3724,53 @@ async function loadVoiceMessages() {
     } catch (error) {
         console.error('Failed to load voice messages:', error);
         voiceMessages = [];
+    }
+}
+
+const FONT_OPTIONS = {
+    'Inter':   { url: 'Inter:wght@200;300;400;500;600;700', stack: "'Inter', sans-serif" },
+    'Roboto':  { url: 'Roboto:wght@300;400;500;700', stack: "'Roboto', sans-serif" },
+    'Nunito':  { url: 'Nunito:wght@300;400;500;600;700', stack: "'Nunito', sans-serif" },
+    'DM Sans': { url: 'DM+Sans:wght@300;400;500;600;700', stack: "'DM Sans', sans-serif" },
+    'Outfit':  { url: 'Outfit:wght@300;400;500;600;700', stack: "'Outfit', sans-serif" },
+    'Poppins': { url: 'Poppins:wght@300;400;500;600;700', stack: "'Poppins', sans-serif" },
+};
+
+function applyFontFamily() {
+    const name = globalConfig.fontFamily || 'Inter';
+    const font = FONT_OPTIONS[name] || FONT_OPTIONS['Inter'];
+
+    let link = document.getElementById('dynamicFontLink');
+    if (!link) {
+        link = document.createElement('link');
+        link.id = 'dynamicFontLink';
+        link.rel = 'stylesheet';
+        document.head.appendChild(link);
+    }
+    link.href = `https://fonts.googleapis.com/css2?family=${font.url}&display=swap`;
+
+    document.documentElement.style.setProperty('--font-body', font.stack);
+}
+
+function applyDeviceModel() {
+    document.querySelector('.container').classList.toggle('pro120', globalConfig.deviceModel === 'pro120');
+}
+
+function applyVoiceMessageVisibility() {
+    document.getElementById('phoneBtn').style.display =
+        globalConfig.hideVoiceMessages ? 'none' : '';
+}
+
+function applyHeaderVisibility() {
+    const header = document.querySelector('.header');
+    const roomName = document.getElementById('roomName');
+    if (!header) return;
+    if (globalConfig.hideHeader) {
+        header.style.display = 'none';
+    } else {
+        header.style.display = '';
+        // opacity:0 keeps the tap target alive so openAdmin() still works
+        if (roomName) roomName.style.opacity = globalConfig.hideRoomName ? '0' : '';
     }
 }
 

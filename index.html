@@ -6,9 +6,9 @@
     <title>NSPanel Dashboard</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@200;300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20,300,0,0" />
     <link rel="stylesheet" href="styles.css">
+    <link rel="stylesheet" href="custom.css">
 </head>
 <body>
     <div class="container">
@@ -34,8 +34,15 @@
             <div class="pages-wrapper" id="pagesWrapper">
                 <!-- Pages will be generated here -->
             </div>
+            <div class="loading-overlay" id="loadingOverlay">Loading...</div>
         </div>
         <div class="page-dots" id="pageDots"></div>
+        <button class="debug-edit-btn" id="debugEditBtn" onclick="openAdmin()" title="Open Admin" style="display:none;">
+            <span class="material-symbols-outlined">edit</span>
+        </button>
+        <button class="debug-edit-btn" id="debugSettingsBtn" onclick="openAdmin(); showGlobalSettings();" title="Global Settings" style="display:none; bottom: 64px;">
+            <span class="material-symbols-outlined">settings</span>
+        </button>
     </div>
 
     <!-- Screensaver -->
@@ -111,7 +118,15 @@
                 <button class="climate-modal-close" onclick="closeIconPicker()">close</button>
             </div>
             <div class="climate-modal-body">
-                <input type="text" class="form-input" id="iconSearchInput" placeholder="Search icons..." style="margin-bottom: 12px;">
+                <input type="text" class="form-input" id="iconSearchInput" placeholder="Search icons..." aria-label="Search icons" style="margin-bottom: 8px;">
+                <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 12px;">
+                    <input type="text" class="form-input" id="iconCustomInput" placeholder="Or type any icon name..." aria-label="Custom icon name" style="flex: 1;">
+                    <button onclick="selectCustomIcon()" style="background: rgba(66,165,245,0.15); border: 1px solid rgba(66,165,245,0.4); color: #42a5f5; padding: 10px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; white-space: nowrap;">Use icon</button>
+                    <span id="iconCustomPreview" style="font-family: 'Material Symbols Outlined'; font-size: 28px; color: rgba(255,255,255,0.4); min-width: 32px; text-align: center;"></span>
+                </div>
+                <div style="margin-bottom: 12px; font-size: 11px; color: rgba(255,255,255,0.35);">
+                    Browse all icons at <a href="https://fonts.google.com/icons" target="_blank" rel="noopener" style="color: rgba(66,165,245,0.7); text-decoration: underline;">fonts.google.com/icons</a>
+                </div>
                 <div class="icon-grid" id="iconGrid">
                     <!-- Icons will be generated here -->
                 </div>
@@ -129,6 +144,152 @@
             <div class="climate-modal-body">
                 <div id="voiceMessageContent">
                     <!-- Content will be generated here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Entity Editor Modal -->
+    <div class="climate-modal" id="entityEditorModal" onclick="closeEntityModal(event)">
+        <div class="climate-modal-content" onclick="event.stopPropagation()">
+            <div class="climate-modal-header">
+                <div class="climate-modal-title" id="entityEditorTitle">Add Entity</div>
+                <button class="climate-modal-close" onclick="closeEntityModal()">close</button>
+            </div>
+            <div class="climate-modal-body">
+                <div style="display: flex; flex-direction: column; gap: 14px;">
+                    <div style="display: flex; gap: 12px;">
+                        <div style="display: flex; flex-direction: column; gap: 4px; flex: 1;">
+                            <label class="form-label" for="newEntityDomain">Domain</label>
+                            <select class="form-input" id="newEntityDomain" onchange="updateEntityFormForDomain()">
+                                <option value="light">light</option>
+                                <option value="switch">switch</option>
+                                <option value="scene">scene</option>
+                                <option value="script">script</option>
+                                <option value="climate">climate</option>
+                                <option value="sensor">sensor</option>
+                                <option value="media_player">media_player</option>
+                                <option value="cover">cover</option>
+                                <option value="lock">lock</option>
+                                <option value="fan">fan</option>
+                                <option value="group">group</option>
+                                <option value="input_boolean">input_boolean</option>
+                                <option value="automation">automation</option>
+                                <option value="weather">weather</option>
+                                <option value="clock">clock</option>
+                            </select>
+                        </div>
+                        <div id="entityOptEntityId" style="display: flex; flex-direction: column; gap: 4px; flex: 2;">
+                            <label class="form-label" for="newEntityId">Entity ID</label>
+                            <input type="text" class="form-input" id="newEntityId" placeholder="living_room">
+                        </div>
+                    </div>
+                    <div id="entityOptLabel" style="display: flex; flex-direction: column; gap: 4px;">
+                        <label class="form-label" for="newEntityLabel">Label</label>
+                        <input type="text" class="form-input" id="newEntityLabel" placeholder="Living Room">
+                    </div>
+                    <div id="entityOptIcon" style="display: flex; flex-direction: column; gap: 4px;">
+                        <label class="form-label">Icon</label>
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <button onclick="openIconPicker()" id="iconPickerButton" style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.15); color: rgba(255,255,255,0.7); padding: 10px 16px; border-radius: 8px; cursor: pointer; font-family: 'Material Symbols Outlined'; font-size: 22px; display: flex; align-items: center; gap: 8px; flex: 1;">
+                                <span id="selectedIconPreview">search</span>
+                                <span id="selectedIconName" style="font-family: 'Inter', sans-serif; font-size: 12px; color: rgba(255,255,255,0.5);">Choose icon</span>
+                            </button>
+                            <input type="hidden" id="newEntityIcon" value="">
+                        </div>
+                    </div>
+                    <div id="entityOptHideState">
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="newEntityHideState" aria-label="Hide state text on tile" style="width: 18px; height: 18px; cursor: pointer;">
+                            <span style="font-size: 13px; color: #888;">Hide state text on tile</span>
+                        </label>
+                    </div>
+                    <div id="entityOptDisableAction">
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="newEntityDisableAction" aria-label="Disable action (status only)" style="width: 18px; height: 18px; cursor: pointer;">
+                            <span style="font-size: 13px; color: #888;">Disable action (status only)</span>
+                        </label>
+                    </div>
+                    <div id="entityOptLight" style="display: none;">
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="newEntityDisableDimming" aria-label="Disable dimming" style="width: 18px; height: 18px; cursor: pointer;">
+                            <span style="font-size: 13px; color: #888;">Disable dimming (toggle only)</span>
+                        </label>
+                    </div>
+                    <div id="entityOptSensor" style="display: none; flex-direction: column; gap: 4px;">
+                        <label class="form-label" for="newEntityDecimals">Decimal places</label>
+                        <select id="newEntityDecimals" class="form-input" style="width: 100px; padding: 6px 8px;">
+                            <option value="">Default (0)</option>
+                            <option value="1">1</option>
+                            <option value="2">2</option>
+                            <option value="3">3</option>
+                        </select>
+                    </div>
+                    <div id="entityOptWeather" style="display: none; flex-direction: column; gap: 8px;">
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="newEntityHideWeatherName" aria-label="Hide weather entity name" style="width: 18px; height: 18px; cursor: pointer;">
+                            <span style="font-size: 13px; color: #888;">Hide name</span>
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="newEntityHideWeatherIcon" aria-label="Hide weather icon" style="width: 18px; height: 18px; cursor: pointer;">
+                            <span style="font-size: 13px; color: #888;">Hide icon</span>
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="newEntityHideWeatherForecast" aria-label="Hide weather forecast" style="width: 18px; height: 18px; cursor: pointer;">
+                            <span style="font-size: 13px; color: #888;">Disable forecast popup</span>
+                        </label>
+                        <div style="display: flex; align-items: center; gap: 8px; padding-left: 26px;">
+                            <span style="font-size: 12px; color: #888;">Popup forecast type</span>
+                            <select id="newEntityModalForecastType" class="form-input" aria-label="Popup forecast type" style="width: auto; padding: 6px 8px; font-size: 12px;">
+                                <option value="hourly">Hourly</option>
+                                <option value="daily">Daily</option>
+                            </select>
+                        </div>
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="newEntityShowInlineForecast" aria-label="Show forecast on tile" style="width: 18px; height: 18px; cursor: pointer;">
+                            <span style="font-size: 13px; color: #888;">Show forecast on tile</span>
+                        </label>
+                        <div style="display: flex; align-items: center; gap: 8px; padding-left: 26px;">
+                            <span style="font-size: 12px; color: #888;">Tile forecast type</span>
+                            <select id="newEntityTileForecastType" class="form-input" aria-label="Tile forecast type" style="width: auto; padding: 6px 8px; font-size: 12px;">
+                                <option value="daily">Daily</option>
+                                <option value="hourly">Hourly</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div id="entityOptClock" style="display: none; flex-direction: column; gap: 8px;">
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="newEntityHideClockDate" aria-label="Hide date on tile" style="width: 18px; height: 18px; cursor: pointer;">
+                            <span style="font-size: 13px; color: #888;">Hide date</span>
+                        </label>
+                        <div style="display: flex; align-items: center; gap: 8px; padding-left: 26px;">
+                            <span style="font-size: 12px; color: #888;">Time format</span>
+                            <select id="newEntityClockFormat" class="form-input" aria-label="Time format" style="width: auto; padding: 6px 8px; font-size: 12px;">
+                                <option value="">Use global setting</option>
+                                <option value="24h">24-hour</option>
+                                <option value="12h">12-hour (AM/PM)</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div id="entityOptSize">
+                        <label class="form-label" style="font-size: 11px; margin-bottom: 6px; display: block;">Tile Size</label>
+                        <div style="display: flex; gap: 12px;">
+                            <div style="flex: 1; display: flex; flex-direction: column; gap: 4px;">
+                                <label class="form-label" style="font-size: 10px;">Width</label>
+                                <select class="form-input" id="newEntityTileWidth" style="padding: 6px 8px;">
+                                    <!-- populated dynamically based on room column count -->
+                                </select>
+                            </div>
+                            <div style="flex: 1; display: flex; flex-direction: column; gap: 4px;">
+                                <label class="form-label" style="font-size: 10px;">Height</label>
+                                <select class="form-input" id="newEntityTileHeight" style="padding: 6px 8px;" onchange="updateEntityFormForDomain()">
+                                    <option value="normal">Normal</option>
+                                    <option value="half">Half row</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                    <button class="save-btn" onclick="saveEntityModal()">Save Entity</button>
                 </div>
             </div>
         </div>

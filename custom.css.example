@@ -1,0 +1,32 @@
+/* ============================================================
+   custom.css — local design overrides (copy to custom.css)
+   Loaded after styles.css, so anything here wins.
+   This file is tracked by git; custom.css is not.
+   ============================================================ */
+
+:root {
+    /* Font */
+    --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+
+    /* Page background */
+    --bg:            linear-gradient(135deg, #0f0f0f 0%, #1a1a1a 100%);
+    --gradient-text: linear-gradient(135deg, #fff 0%, #aaa 100%);
+
+    /* Tile geometry */
+    --tile-radius:     16px;
+    --tile-padding:    16px;
+    --tile-icon-size:  28px;
+    --tile-label-size: 14px;
+    --tile-state-size: 10px;
+
+    /* Modal */
+    --modal-width: 380px;
+
+    /* Tile state backgrounds */
+    --tile-on-bg:      linear-gradient(135deg, rgba(66, 165, 245, 0.15) 0%, rgba(33, 150, 243, 0.05) 100%);
+    --tile-climate-bg: linear-gradient(135deg, rgba(33, 150, 243, 0.15) 0%, rgba(33, 150, 243, 0.05) 100%);
+    --tile-heating-bg: linear-gradient(135deg, rgba(255, 87, 34, 0.2) 0%, rgba(255, 87, 34, 0.1) 100%);
+    --tile-cooling-bg: linear-gradient(135deg, rgba(3, 169, 244, 0.2) 0%, rgba(3, 169, 244, 0.1) 100%);
+    --tile-sensor-bg:  linear-gradient(135deg, rgba(156, 39, 176, 0.15) 0%, rgba(156, 39, 176, 0.05) 100%);
+    --tile-spotify-bg: linear-gradient(135deg, rgba(30, 215, 96, 0.15) 0%, rgba(29, 185, 84, 0.05) 100%);
+}

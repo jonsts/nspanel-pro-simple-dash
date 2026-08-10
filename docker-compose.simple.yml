@@ -4,18 +4,11 @@ services:
   simpledash:
     build: .
     container_name: simpledash
-    hostname: simpledash.local
     ports:
       - "8080:80"
-      - "8443:443"
     environment:
-      # URL of your Home Assistant instance (scheme is REQUIRED, e.g. http:// or https://)
-      # Without this, nginx fails to start with "invalid URL prefix in /etc/nginx/nginx.conf"
+      # Required: URL of your Home Assistant instance (scheme required, e.g. http:// or https://)
       - HA_URL=http://homeassistant.local:8123
-      - VIRTUAL_HOST=simpledash.local
-      - VIRTUAL_PORT=80
-      - LETSENCRYPT_HOST=simpledash.local
-      - LETSENCRYPT_EMAIL=your-email@example.com
     volumes:
       - ./index.html:/usr/share/nginx/html/index.html:ro
       - ./styles.css:/usr/share/nginx/html/styles.css:ro
@@ -24,12 +17,6 @@ services:
       - ./custom.css:/usr/share/nginx/html/custom.css:ro
       - simpledash-data:/data
     restart: unless-stopped
-    networks:
-      - proxy
-
-networks:
-  proxy:
-    external: true
 
 volumes:
   simpledash-data:

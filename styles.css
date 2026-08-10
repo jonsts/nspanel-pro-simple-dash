@@ -1,3 +1,34 @@
+/* ============================================
+   DESIGN TOKENS — edit here to restyle the UI
+   ============================================ */
+:root {
+    /* Font (family overridden dynamically via Global Settings) */
+    --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
+
+    /* Background — swap to a flat color, e.g. --bg: #111 */
+    --bg:            linear-gradient(135deg, #0f0f0f 0%, #1a1a1a 100%);
+    --gradient-text: linear-gradient(135deg, #fff 0%, #aaa 100%);
+
+    /* Tiles */
+    --tile-radius:      16px;
+    --tile-padding:     16px;
+    --tile-icon-size:   28px;
+    --tile-icon-size--half-height: 24px;
+    --tile-label-size:  14px;
+    --tile-state-size:  10px;
+
+    /* Modal */
+    --modal-width: 380px;
+
+    /* Tile state gradients — swap to a flat color, e.g. --tile-on-bg: rgba(66,165,245,0.15) */
+    --tile-on-bg:      linear-gradient(135deg, rgba(66, 165, 245, 0.15) 0%, rgba(33, 150, 243, 0.05) 100%);
+    --tile-climate-bg: linear-gradient(135deg, rgba(33, 150, 243, 0.15) 0%, rgba(33, 150, 243, 0.05) 100%);
+    --tile-heating-bg: linear-gradient(135deg, rgba(255, 87, 34, 0.2) 0%, rgba(255, 87, 34, 0.1) 100%);
+    --tile-cooling-bg: linear-gradient(135deg, rgba(3, 169, 244, 0.2) 0%, rgba(3, 169, 244, 0.1) 100%);
+    --tile-sensor-bg:       linear-gradient(135deg, rgba(156, 39, 176, 0.15) 0%, rgba(156, 39, 176, 0.05) 100%);
+    --tile-spotify-bg:      linear-gradient(135deg, rgba(30, 215, 96, 0.15) 0%, rgba(29, 185, 84, 0.05) 100%);
+}
+
 * {
     margin: 0;
     padding: 0;
@@ -6,8 +37,8 @@
 }
 
 body {
-    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
-    background: linear-gradient(135deg, #0f0f0f 0%, #1a1a1a 100%);
+    font-family: var(--font-body);
+    background: var(--bg);
     color: #ffffff;
     overflow: hidden;
     touch-action: pan-y;
@@ -20,6 +51,11 @@ body {
     display: flex;
     flex-direction: column;
     position: relative;
+}
+
+.container.pro120 {
+    height: 890px;
+    width: 500px;
 }
 
 .error-toast {
@@ -156,7 +192,7 @@ body {
     font-size: 20px;
     font-weight: 300;
     letter-spacing: 0.5px;
-    background: linear-gradient(135deg, #fff 0%, #aaa 100%);
+    background: var(--gradient-text);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
@@ -225,6 +261,43 @@ body {
     touch-action: pan-x;
 }
 
+.loading-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 16px;
+    color: rgba(255, 255, 255, 0.4);
+    pointer-events: none;
+}
+
+.loading-overlay.hidden {
+    display: none;
+}
+
+.debug-edit-btn {
+    position: fixed;
+    bottom: 16px;
+    right: 16px;
+    width: 40px;
+    height: 40px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    color: rgba(255, 255, 255, 0.6);
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 500;
+}
+
+.debug-edit-btn:hover {
+    background: rgba(255, 255, 255, 0.2);
+    color: rgba(255, 255, 255, 0.9);
+}
+
 .page {
     min-width: 100%;
     padding: 0 4px;
@@ -236,6 +309,7 @@ body {
 .grid {
     display: grid;
     grid-template-columns: repeat(2, 1fr);
+    grid-auto-rows: 1fr;
     gap: 10px;
     height: 100%;
 }
@@ -247,8 +321,8 @@ body {
 .tile {
     background: rgba(255, 255, 255, 0.05);
     border: 1px solid rgba(255, 255, 255, 0.1);
-    border-radius: 16px;
-    padding: 16px;
+    border-radius: var(--tile-radius);
+    padding: var(--tile-padding);
     cursor: pointer;
     display: flex;
     flex-direction: column;
@@ -260,7 +334,8 @@ body {
     position: relative;
     overflow: hidden;
     backdrop-filter: blur(10px);
-    min-height: 100px;
+    min-height: 0;
+    grid-row: span 2;
 }
 
 .tile::before {
@@ -285,7 +360,7 @@ body {
 
 .tile-icon {
     font-family: 'Material Symbols Outlined';
-    font-size: 28px;
+    font-size: var(--tile-icon-size);
     font-weight: 300;
     margin-bottom: 8px;
     opacity: 0.8;
@@ -304,7 +379,7 @@ body {
 }
 
 .tile.climate {
-    background: linear-gradient(135deg, rgba(33, 150, 243, 0.15) 0%, rgba(33, 150, 243, 0.05) 100%);
+    background: var(--tile-climate-bg);
     border-color: rgba(33, 150, 243, 0.3);
     justify-content: center;
     align-items: center;
@@ -312,13 +387,13 @@ body {
 }
 
 .tile.climate.heating {
-    background: linear-gradient(135deg, rgba(255, 87, 34, 0.2) 0%, rgba(255, 87, 34, 0.1) 100%);
+    background: var(--tile-heating-bg);
     border-color: rgba(255, 87, 34, 0.4);
     box-shadow: 0 8px 24px rgba(255, 87, 34, 0.2);
 }
 
 .tile.climate.cooling {
-    background: linear-gradient(135deg, rgba(3, 169, 244, 0.2) 0%, rgba(3, 169, 244, 0.1) 100%);
+    background: var(--tile-cooling-bg);
     border-color: rgba(3, 169, 244, 0.4);
     box-shadow: 0 8px 24px rgba(3, 169, 244, 0.2);
 }
@@ -327,8 +402,18 @@ body {
     color: #4caf50;
 }
 
+.tile.lock .tile-icon,
+.tile.lock .tile-state {
+    color: #4caf50;
+}
+
+.tile.lock.on .tile-icon,
+.tile.lock.on .tile-state {
+    color: #ef5350;
+}
+
 .tile.sensor {
-    background: linear-gradient(135deg, rgba(156, 39, 176, 0.15) 0%, rgba(156, 39, 176, 0.05) 100%);
+    background: var(--tile-sensor-bg);
     border-color: rgba(156, 39, 176, 0.3);
     cursor: default;
     justify-content: center;
@@ -343,6 +428,32 @@ body {
     justify-content: center;
     align-items: center;
     text-align: center;
+}
+
+.tile.clock {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.1);
+    cursor: default;
+    justify-content: center;
+    align-items: center;
+    text-align: center;
+}
+
+.clock-time {
+    font-size: 32px;
+    font-weight: 200;
+    letter-spacing: -0.5px;
+    margin: 4px 0;
+    line-height: 1;
+}
+
+.clock-date {
+    font-size: 11px;
+    font-weight: 400;
+    opacity: 0.6;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+    margin-top: 4px;
 }
 
 .weather-icon {
@@ -366,6 +477,75 @@ body {
     text-transform: uppercase;
     letter-spacing: 0.8px;
     margin-top: 4px;
+}
+
+.weather-forecast-strip {
+    display: flex;
+    gap: 6px;
+    margin-top: 10px;
+    width: 100%;
+}
+
+.tile.weather.tile-half-height .weather-forecast-strip {
+    display: none;
+}
+
+.tile.weather.full-row .weather-forecast-strip {
+    margin-top: 0;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.weather-forecast-strip .weather-forecast-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    flex: 1;
+    background: rgba(255, 255, 255, 0.05);
+    border-radius: 8px;
+    padding: 6px 4px;
+}
+
+.tile.weather.full-row .weather-forecast-item {
+    flex-direction: row;
+    justify-content: space-between;
+    padding: 4px 8px;
+}
+
+.weather-forecast-strip .weather-forecast-icon {
+    font-size: 16px;
+    color: #03a9f4;
+}
+
+.weather-forecast-strip .weather-forecast-day {
+    font-size: 9px;
+    opacity: 0.5;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.weather-forecast-strip .weather-forecast-temp {
+    font-size: 11px;
+    font-weight: 500;
+}
+
+.tile.weather.full-row {
+    flex-direction: row;
+    align-items: center;
+    justify-content: flex-start;
+    text-align: left;
+    gap: 16px;
+}
+
+.tile.weather.full-row .weather-icon {
+    font-size: 48px !important;
+    margin-bottom: 0;
+    flex-shrink: 0;
+}
+
+.tile.weather.full-row .weather-temp {
+    font-size: 28px;
 }
 
 .tile.media_player {
@@ -449,7 +629,7 @@ body {
 }
 
 .tile.media_player .tile-label {
-    font-size: 14px;
+    font-size: var(--tile-label-size);
     font-weight: 600;
     margin-bottom: 4px;
     letter-spacing: 0;
@@ -568,7 +748,7 @@ body {
 }
 
 .climate-mode {
-    font-size: 9px;
+    font-size: var(--tile-state-size);
     font-weight: 300;
     opacity: 0.5;
     text-transform: uppercase;
@@ -601,7 +781,7 @@ body {
     font-weight: 200;
     letter-spacing: -1px;
     margin-bottom: 8px;
-    background: linear-gradient(135deg, #fff 0%, #888 100%);
+    background: var(--gradient-text);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
@@ -657,7 +837,7 @@ body {
     font-size: 48px;
     font-weight: 200;
     letter-spacing: -1px;
-    background: linear-gradient(135deg, #fff 0%, #888 100%);
+    background: var(--gradient-text);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
@@ -671,14 +851,14 @@ body {
 }
 
 .tile-label {
-    font-size: 14px;
+    font-size: var(--tile-label-size);
     font-weight: 500;
     margin-bottom: 2px;
     letter-spacing: 0.2px;
 }
 
 .tile-state {
-    font-size: 10px;
+    font-size: var(--tile-state-size);
     opacity: 0.5;
     text-transform: uppercase;
     font-weight: 400;
@@ -690,8 +870,45 @@ body {
     cursor: not-allowed;
 }
 
+.tile.no-action {
+    cursor: default;
+    box-shadow: inset 0 0 0 1000px rgba(0, 0, 0, 0.45);
+}
+
+.tile.no-action:active,
+.tile.no-tap:active {
+    transform: none;
+}
+
+.tile.no-action:active::before,
+.tile.no-tap:active::before {
+    opacity: 0;
+}
+
+.tile.tile-half-height {
+    grid-row: span 1;
+    flex-direction: row;
+    justify-content: center;
+    align-items: center;
+}
+
+.tile.tile-half-height .tile-icon {
+    margin-bottom: 0;
+    font-size: var(--tile-icon-size--half-height);
+}
+
+.tile.tile-half-height .tile-content {
+    margin-left: 16px;
+    flex-grow: 1;
+}
+
+.tile.tile-half-height.sensor,
+.tile.tile-half-height.climate {
+    justify-content: space-between;
+}
+
 .tile.assistant-command {
-    background: linear-gradient(135deg, rgba(66, 165, 245, 0.15) 0%, rgba(33, 150, 243, 0.05) 100%);
+    background: var(--tile-on-bg);
     border-color: rgba(66, 165, 245, 0.3);
 }
 
@@ -706,7 +923,7 @@ body {
 }
 
 .tile.spotify-playlist {
-    background: linear-gradient(135deg, rgba(30, 215, 96, 0.15) 0%, rgba(29, 185, 84, 0.05) 100%);
+    background: var(--tile-spotify-bg);
     border-color: rgba(30, 215, 96, 0.3);
 }
 
@@ -752,6 +969,10 @@ body {
     gap: 8px;
     margin-top: 12px;
     padding: 8px 0;
+}
+
+.dot:only-child {
+    display: none;
 }
 
 .dot {
@@ -965,7 +1186,7 @@ body {
     left: 0;
     right: 0;
     bottom: 0;
-    background: linear-gradient(135deg, #0f0f0f 0%, #1a1a1a 100%);
+    background: var(--bg);
     z-index: 1000;
     overflow-y: auto;
     padding: 20px;
@@ -1013,6 +1234,21 @@ body {
 
 .form-group {
     margin-bottom: 20px;
+}
+
+.settings-section {
+    margin-bottom: 28px;
+}
+
+.settings-section-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.5);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    margin-bottom: 14px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
 }
 
 .form-label {
@@ -1212,7 +1448,7 @@ body {
     background: linear-gradient(135deg, #1a1a1a 0%, #0f0f0f 100%);
     border: 1px solid rgba(255, 255, 255, 0.15);
     border-radius: 20px;
-    width: 380px;
+    width: var(--modal-width);
     max-width: 90%;
     box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
     overflow: hidden;
@@ -1269,7 +1505,7 @@ body {
     font-size: 56px;
     font-weight: 200;
     letter-spacing: -1px;
-    background: linear-gradient(135deg, #fff 0%, #888 100%);
+    background: var(--gradient-text);
     -webkit-background-clip: text;
     -webkit-text-fill-color: transparent;
     background-clip: text;
@@ -1440,6 +1676,7 @@ body {
     font-weight: 500;
     min-width: 40px;
     text-align: right;
+    white-space: nowrap;
 }
 
 /* Icon Picker */
@@ -1498,7 +1735,11 @@ body {
 }
 
 
-/* Icon Picker Modal - Wider than other modals */
+/* Icon Picker Modal - Wider than other modals, higher z-index to overlay entity editor */
+#iconPickerModal {
+    z-index: 2100;
+}
+
 #iconPickerModal .climate-modal-content {
     width: 440px;
     max-width: 95%;
