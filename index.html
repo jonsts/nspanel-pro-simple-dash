@@ -122,9 +122,9 @@
                 <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 12px;">
                     <input type="text" class="form-input" id="iconCustomInput" placeholder="Or type any icon name..." aria-label="Custom icon name" style="flex: 1;">
                     <button onclick="selectCustomIcon()" style="background: rgba(66,165,245,0.15); border: 1px solid rgba(66,165,245,0.4); color: #42a5f5; padding: 10px 14px; border-radius: 8px; cursor: pointer; font-size: 13px; white-space: nowrap;">Use icon</button>
-                    <span id="iconCustomPreview" style="font-family: 'Material Symbols Outlined'; font-size: 28px; color: rgba(255,255,255,0.4); min-width: 32px; text-align: center;"></span>
+                    <span id="iconCustomPreview" style="font-family: 'Material Symbols Outlined'; font-size: 28px; color: rgba(var(--fg-rgb), 0.4); min-width: 32px; text-align: center;"></span>
                 </div>
-                <div style="margin-bottom: 12px; font-size: 11px; color: rgba(255,255,255,0.35);">
+                <div style="margin-bottom: 12px; font-size: 11px; color: rgba(var(--fg-rgb), 0.35);">
                     Browse all icons at <a href="https://fonts.google.com/icons" target="_blank" rel="noopener" style="color: rgba(66,165,245,0.7); text-decoration: underline;">fonts.google.com/icons</a>
                 </div>
                 <div class="icon-grid" id="iconGrid">
@@ -191,9 +191,9 @@
                     <div id="entityOptIcon" style="display: flex; flex-direction: column; gap: 4px;">
                         <label class="form-label">Icon</label>
                         <div style="display: flex; gap: 8px; align-items: center;">
-                            <button onclick="openIconPicker()" id="iconPickerButton" style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.15); color: rgba(255,255,255,0.7); padding: 10px 16px; border-radius: 8px; cursor: pointer; font-family: 'Material Symbols Outlined'; font-size: 22px; display: flex; align-items: center; gap: 8px; flex: 1;">
+                            <button onclick="openIconPicker()" id="iconPickerButton" style="background: rgba(var(--fg-rgb), 0.05); border: 1px solid rgba(var(--fg-rgb), 0.15); color: rgba(var(--fg-rgb), 0.7); padding: 10px 16px; border-radius: 8px; cursor: pointer; font-family: 'Material Symbols Outlined'; font-size: 22px; display: flex; align-items: center; gap: 8px; flex: 1;">
                                 <span id="selectedIconPreview">search</span>
-                                <span id="selectedIconName" style="font-family: 'Inter', sans-serif; font-size: 12px; color: rgba(255,255,255,0.5);">Choose icon</span>
+                                <span id="selectedIconName" style="font-family: 'Inter', sans-serif; font-size: 12px; color: rgba(var(--fg-rgb), 0.5);">Choose icon</span>
                             </button>
                             <input type="hidden" id="newEntityIcon" value="">
                         </div>
@@ -224,6 +224,19 @@
                             <option value="2">2</option>
                             <option value="3">3</option>
                         </select>
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer; margin-top: 6px;">
+                            <input type="checkbox" id="newEntityShowGauge" aria-label="Show as gauge" style="width: 18px; height: 18px; cursor: pointer;">
+                            <span style="font-size: 13px; color: #888;">Show as gauge</span>
+                        </label>
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <input type="number" id="newEntityGaugeMin" class="form-input" placeholder="Min (0)" aria-label="Gauge minimum" style="width: 100px; padding: 6px 8px;">
+                            <input type="number" id="newEntityGaugeMax" class="form-input" placeholder="Max (100)" aria-label="Gauge maximum" style="width: 100px; padding: 6px 8px;">
+                        </div>
+                        <div style="display: flex; gap: 8px; align-items: center;">
+                            <input type="number" id="newEntityGaugeYellow" class="form-input" placeholder="Yellow from" aria-label="Gauge yellow threshold" style="width: 100px; padding: 6px 8px;">
+                            <input type="number" id="newEntityGaugeRed" class="form-input" placeholder="Red from" aria-label="Gauge red threshold" style="width: 100px; padding: 6px 8px;">
+                        </div>
+                        <small style="color: #888; font-size: 12px;">Below yellow = green. Leave both empty for a blue → red gradient.</small>
                     </div>
                     <div id="entityOptWeather" style="display: none; flex-direction: column; gap: 8px;">
                         <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">

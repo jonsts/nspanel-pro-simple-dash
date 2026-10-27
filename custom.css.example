@@ -4,13 +4,10 @@
    This file is tracked by git; custom.css is not.
    ============================================================ */
 
+/* ---------- Shared (both themes) ---------- */
 :root {
     /* Font */
     --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif;
-
-    /* Page background */
-    --bg:            linear-gradient(135deg, #0f0f0f 0%, #1a1a1a 100%);
-    --gradient-text: linear-gradient(135deg, #fff 0%, #aaa 100%);
 
     /* Tile geometry */
     --tile-radius:     16px;
@@ -21,12 +18,37 @@
 
     /* Modal */
     --modal-width: 380px;
+}
 
-    /* Tile state backgrounds */
-    --tile-on-bg:      linear-gradient(135deg, rgba(66, 165, 245, 0.15) 0%, rgba(33, 150, 243, 0.05) 100%);
-    --tile-climate-bg: linear-gradient(135deg, rgba(33, 150, 243, 0.15) 0%, rgba(33, 150, 243, 0.05) 100%);
-    --tile-heating-bg: linear-gradient(135deg, rgba(255, 87, 34, 0.2) 0%, rgba(255, 87, 34, 0.1) 100%);
-    --tile-cooling-bg: linear-gradient(135deg, rgba(3, 169, 244, 0.2) 0%, rgba(3, 169, 244, 0.1) 100%);
-    --tile-sensor-bg:  linear-gradient(135deg, rgba(156, 39, 176, 0.15) 0%, rgba(156, 39, 176, 0.05) 100%);
-    --tile-spotify-bg: linear-gradient(135deg, rgba(30, 215, 96, 0.15) 0%, rgba(29, 185, 84, 0.05) 100%);
+/* ---------- Dark theme ---------- */
+:root {
+    --bg:            linear-gradient(135deg, #0f0f0f 0%, #1a1a1a 100%);
+    --gradient-text: linear-gradient(135deg, #fff 0%, #aaa 100%);
+    --surface:       linear-gradient(135deg, #1a1a1a 0%, #0f0f0f 100%);
+    --tile-bg:       rgba(255, 255, 255, 0.05);
+
+    --tile-on-bg:        linear-gradient(135deg, rgba(66, 165, 245, 0.15) 0%, rgba(33, 150, 243, 0.05) 100%);
+    --tile-climate-bg:   linear-gradient(135deg, rgba(33, 150, 243, 0.15) 0%, rgba(33, 150, 243, 0.05) 100%);
+    --tile-heating-bg:   linear-gradient(135deg, rgba(255, 87, 34, 0.2) 0%, rgba(255, 87, 34, 0.1) 100%);
+    --tile-cooling-bg:   linear-gradient(135deg, rgba(3, 169, 244, 0.2) 0%, rgba(3, 169, 244, 0.1) 100%);
+    --tile-sensor-bg:    var(--tile-bg);
+    --tile-spotify-bg:   linear-gradient(135deg, rgba(30, 215, 96, 0.15) 0%, rgba(29, 185, 84, 0.05) 100%);
+    --tile-switch-on-bg: linear-gradient(135deg, rgba(255, 193, 7, 0.28) 0%, rgba(255, 193, 7, 0.08) 100%);
+}
+
+/* ---------- Light theme (defaults + extra rules live in styles.css) ---------- */
+:root[data-theme="light"] {
+    --fg-rgb:        28, 28, 30;
+    --bg:            linear-gradient(135deg, #f5f5f7 0%, #e6e7eb 100%);
+    --gradient-text: linear-gradient(135deg, #1c1c1e 0%, #5a5a60 100%);
+    --surface:       linear-gradient(135deg, #ffffff 0%, #f5f5f7 100%);
+    --tile-bg:       rgba(255, 255, 255, 0.85);
+
+    /* Stronger tints so colored tiles still read on a light page */
+    --tile-on-bg:        linear-gradient(135deg, rgba(66, 165, 245, 0.22) 0%, rgba(33, 150, 243, 0.08) 100%);
+    --tile-climate-bg:   linear-gradient(135deg, rgba(33, 150, 243, 0.2) 0%, rgba(33, 150, 243, 0.07) 100%);
+    --tile-heating-bg:   linear-gradient(135deg, rgba(255, 87, 34, 0.25) 0%, rgba(255, 87, 34, 0.1) 100%);
+    --tile-cooling-bg:   linear-gradient(135deg, rgba(3, 169, 244, 0.25) 0%, rgba(3, 169, 244, 0.1) 100%);
+    --tile-spotify-bg:   linear-gradient(135deg, rgba(30, 215, 96, 0.22) 0%, rgba(29, 185, 84, 0.08) 100%);
+    --tile-switch-on-bg: linear-gradient(135deg, rgba(255, 193, 7, 0.4) 0%, rgba(255, 193, 7, 0.14) 100%);
 }

@@ -23,7 +23,8 @@ const DEFAULT_GLOBAL_CONFIG = {
     screensaverTimeFormat: '24h', // '24h' or '12h'
     hideVoiceMessages: false,
     deviceModel: 'pro',
-    fontFamily: 'Inter'
+    fontFamily: 'Inter',
+    theme: 'dark'
 };
 
 // Split entities into pages by simulating the grid's row-major auto-placement
@@ -94,6 +95,7 @@ function paginateEntities(items, gridColumns, gridRows) {
 let config = null;
 let globalConfig = null;
 let roomConfigs = [];
+let gaugeSeq = 0; // unique SVG gradient ids per rendered gauge
 let entityStates = {};
 let isConnected = false;
 let currentPage = 0;
@@ -225,8 +227,10 @@ async function saveConfig() {
             roomName: config.roomName,
             headerTempEntity: config.headerTempEntity,
             screensaverWeather: config.screensaverWeather,
+            wakeEntity: config.wakeEntity,
             gridColumns: config.gridColumns,
             gridRows: config.gridRows,
+            theme: roomConfigs.find(r => r.roomName === config.roomName)?.theme || '',
             entities: config.entities,
             assistantCommands: config.assistantCommands || [],
             spotifyPlaylists: config.spotifyPlaylists || []
@@ -357,6 +361,7 @@ function getWatchedEntityIds() {
         .filter(id => !NON_HA_DOMAINS.includes(id.split('.')[0]));
     if (config.headerTempEntity) ids.push(config.headerTempEntity);
     if (config.screensaverWeather) ids.push(config.screensaverWeather);
+    if (config.wakeEntity) ids.push(config.wakeEntity);
     return [...new Set(ids)].filter(id => VALID_ENTITY_ID.test(id));
 }
 
@@ -627,6 +632,10 @@ let pendingRenderIds = new Set();
 let clockTileTimer = null;
 
 function onEntitiesChanged(changedIds) {
+    if (changedIds.has(config.wakeEntity) && isWakeEntityOn() &&
+        document.getElementById('screensaver').classList.contains('active')) {
+        exitScreensaver();
+    }
     changedIds.forEach(id => pendingRenderIds.add(id));
     // Don't re-render while a slider is being dragged; endSliderDrag() catches up.
     if (isSliderDragging || document.hidden) return;
@@ -1939,7 +1948,58 @@ function createSensorTile(entity, state) {
     }
 
     tile.appendChild(label);
-    tile.appendChild(tempDisplay);
+
+    if (entity.showGauge) {
+        // Semicircle (center 50,50, r 40): gradient sectors, tick marks, pointer at the value.
+        // f is the 0..1 fraction of the sweep, left → right.
+        const min = entity.gaugeMin ?? 0;
+        const max = entity.gaugeMax ?? 100;
+        const value = state ? parseFloat(state.state) : NaN;
+        const toF = v => max <= min ? 0 : Math.min(1, Math.max(0, (v - min) / (max - min)));
+        const f = isNaN(value) ? 0 : toF(value);
+        const pt = (f, r) => [50 - r * Math.cos(f * Math.PI), 50 - r * Math.sin(f * Math.PI)].map(n => n.toFixed(2));
+        const arc = (a, b, r) => `M${pt(a, r)} A${r} ${r} 0 0 1 ${pt(b, r)}`;
+
+        // Sector bounds + colors: thresholds if set, otherwise four bands blue → red
+        const thresholds = [entity.gaugeYellow, entity.gaugeRed];
+        const bounds = thresholds.some(t => t !== undefined)
+            ? [0, ...thresholds.filter(t => t !== undefined).map(toF), 1]
+            : [0, 0.25, 0.5, 0.75, 1];
+        const colors = thresholds.some(t => t !== undefined)
+            ? ['#66bb6a', entity.gaugeYellow !== undefined && '#ffca28', entity.gaugeRed !== undefined && '#ef5350'].filter(Boolean)
+            : ['#42a5f5', '#66bb6a', '#ffca28', '#ef5350'];
+        // Gradient runs along x, so convert each sector's middle to its x offset on the arc
+        const stops = colors.map((c, i) => {
+            const mid = (bounds[i] + bounds[i + 1]) / 2;
+            return `<stop offset="${((1 - Math.cos(mid * Math.PI)) / 2).toFixed(3)}" stop-color="${c}"/>`;
+        }).join('');
+        const gap = 0.012;
+        // Sectors drawn dim in full, then bright up to the value
+        const sectorPaths = upTo => colors.map((_, i) => {
+            const a = bounds[i] + (i ? gap : 0);
+            const b = Math.min(bounds[i + 1] - (i < colors.length - 1 ? gap : 0), upTo);
+            return b > a ? `<path d="${arc(a, b, 40)}"/>` : '';
+        }).join('');
+        const ticks = Array.from({ length: 21 }, (_, i) =>
+            `<path d="M${pt(i / 20, 34)} L${pt(i / 20, i % 5 ? 32 : 30)}" class="${i % 5 ? '' : 'major'}"/>`
+        ).join('');
+        const gradId = `gauge-grad-${++gaugeSeq}`;
+
+        const gauge = document.createElement('div');
+        gauge.className = 'sensor-gauge';
+        gauge.innerHTML = `
+            <svg viewBox="0 0 100 56" aria-hidden="true">
+                <defs><linearGradient id="${gradId}" gradientUnits="userSpaceOnUse" x1="10" y1="0" x2="90" y2="0">${stops}</linearGradient></defs>
+                <g class="gauge-sectors" stroke="url(#${gradId})">${sectorPaths(1)}</g>
+                <g class="gauge-sectors gauge-fill" stroke="url(#${gradId})">${sectorPaths(f)}</g>
+                <g class="gauge-ticks">${ticks}</g>
+                ${isNaN(value) ? '' : `<path class="gauge-pointer" d="M${pt(f, 45)} L${pt(f, 31)}"/><circle class="gauge-knob" cx="${pt(f, 40)[0]}" cy="${pt(f, 40)[1]}" r="2.6"/>`}
+            </svg>`;
+        gauge.appendChild(tempDisplay);
+        tile.appendChild(gauge);
+    } else {
+        tile.appendChild(tempDisplay);
+    }
 
     return tile;
 }
@@ -2361,7 +2421,16 @@ function resetInactivityTimer() {
     inactivityTimer = setTimeout(enterScreensaver, timeout);
 }
 
+function isWakeEntityOn() {
+    return !!config.wakeEntity && entityStates[config.wakeEntity]?.state === 'on';
+}
+
 function enterScreensaver() {
+    // Stay awake while the room's motion sensor still reports presence
+    if (isWakeEntityOn()) {
+        resetInactivityTimer();
+        return;
+    }
     document.getElementById('screensaver').classList.add('active');
     updateScreensaverClock();
     screensaverClockInterval = setInterval(updateScreensaverClock, 1000);
@@ -2546,7 +2615,7 @@ function showRoomManager() {
         <div class="error-message" id="errorMessage"></div>
 
         ${!config && hasRooms ? `
-        <div style="background: rgba(99, 179, 237, 0.15); border: 1px solid rgba(99, 179, 237, 0.4); border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; color: rgba(255,255,255,0.85); font-size: 13px;">
+        <div style="background: rgba(99, 179, 237, 0.15); border: 1px solid rgba(99, 179, 237, 0.4); border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; color: rgba(var(--fg-rgb), 0.85); font-size: 13px;">
             Select a room for this panel to get started.
         </div>` : ''}
 
@@ -2566,7 +2635,7 @@ function showRoomManager() {
 
         <button class="add-btn" style="width: 100%; margin-bottom: 24px;" onclick="showRoomEditor('new')">+ New Room</button>
 
-        <div style="border-top: 1px solid rgba(255, 255, 255, 0.1); padding-top: 20px; margin-top: 4px;">
+        <div style="border-top: 1px solid rgba(var(--fg-rgb), 0.1); padding-top: 20px; margin-top: 4px;">
             <button class="save-btn" style="background: linear-gradient(135deg, #666 0%, #444 100%);" onclick="showGlobalSettings()">Global Settings</button>
         </div>
     `;
@@ -2626,6 +2695,13 @@ function showGlobalSettings() {
                 </select>
             </div>
             <div class="form-group">
+                <label class="form-label">Default Theme</label>
+                <select class="form-input" id="themeInput">
+                    <option value="dark" ${globalConfig.theme !== 'light' ? 'selected' : ''}>Dark</option>
+                    <option value="light" ${globalConfig.theme === 'light' ? 'selected' : ''}>Light</option>
+                </select>
+            </div>
+            <div class="form-group">
                 <label class="form-label">Font Family</label>
                 <select class="form-input" id="fontFamilyInput">
                     ${Object.keys(FONT_OPTIONS).map(name =>
@@ -2675,7 +2751,7 @@ function showGlobalSettings() {
                 </label>
                 <small style="color: #888; font-size: 12px; display: block; margin-top: 4px;">
                     Use if you prefer Fully Kiosk's screensaver instead.<br>
-                    <strong>Standalone URL:</strong> <code style="background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px;">${window.location.origin}/?screensaver=true</code>
+                    <strong>Standalone URL:</strong> <code style="background: rgba(var(--fg-rgb), 0.1); padding: 2px 6px; border-radius: 4px;">${window.location.origin}/?screensaver=true</code>
                 </small>
             </div>
         </div>
@@ -2707,8 +2783,10 @@ function getRoomEditorCurrentState() {
         roomName: document.getElementById('roomNameInput')?.value.trim() || '',
         headerTempEntity: document.getElementById('headerTempEntityInput')?.value.trim() || '',
         screensaverWeather: document.getElementById('screensaverWeatherInput')?.value.trim() || '',
+        wakeEntity: document.getElementById('wakeEntityInput')?.value.trim() || '',
         gridColumns: parseInt(document.getElementById('gridColumnsInput')?.value) || 2,
         gridRows: parseInt(document.getElementById('gridRowsInput')?.value) || 2,
+        theme: document.getElementById('roomThemeInput')?.value || '',
         entities: window.editingRoomData?.entities || [],
         assistantCommands: window.editingRoomData?.assistantCommands || [],
         spotifyPlaylists: window.editingRoomData?.spotifyPlaylists || [],
@@ -2777,6 +2855,15 @@ function showRoomEditor(mode, roomIdx) {
         </div>
 
         <div class="form-group">
+            <label class="form-label">Theme</label>
+            <select class="form-input" id="roomThemeInput">
+                <option value="" ${!roomData.theme ? 'selected' : ''}>Global default</option>
+                <option value="dark" ${roomData.theme === 'dark' ? 'selected' : ''}>Dark</option>
+                <option value="light" ${roomData.theme === 'light' ? 'selected' : ''}>Light</option>
+            </select>
+        </div>
+
+        <div class="form-group">
             <label class="form-label">Header Temperature Entity (Optional)</label>
             <input type="text" class="form-input" id="headerTempEntityInput" placeholder="climate.bedroom or sensor.bedroom_temperature" value="${roomData.headerTempEntity || ''}">
             <small style="color: #888; font-size: 12px;">Shows temperature in header with controls for climate entities</small>
@@ -2786,6 +2873,12 @@ function showRoomEditor(mode, roomIdx) {
             <label class="form-label">Screensaver Weather Entity (Optional)</label>
             <input type="text" class="form-input" id="screensaverWeatherInput" placeholder="weather.home" value="${roomData.screensaverWeather || ''}">
             <small style="color: #888; font-size: 12px;">Shows weather on screensaver</small>
+        </div>
+
+        <div class="form-group">
+            <label class="form-label">Wake Entity (Optional)</label>
+            <input type="text" class="form-input" id="wakeEntityInput" placeholder="binary_sensor.bathroom_motion" value="${(roomData.wakeEntity || '').replace(/[&"<>]/g, c => `&#${c.charCodeAt(0)};`)}">
+            <small style="color: #888; font-size: 12px;">Hides the screensaver while this entity is "on" (e.g. a motion sensor)</small>
         </div>
 
         <div class="form-group">
@@ -2814,9 +2907,9 @@ function showRoomEditor(mode, roomIdx) {
                 <input type="text" class="form-input" id="newPlaylistUrl" placeholder="https://open.spotify.com/playlist/... or spotify:playlist:...">
                 <div style="display: flex; gap: 8px; align-items: center;">
                     <label class="form-label" style="margin: 0; min-width: 40px;">Icon:</label>
-                    <button onclick="openPlaylistIconPicker()" id="playlistIconPickerButton" style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.15); color: rgba(255,255,255,0.7); padding: 12px 20px; border-radius: 8px; cursor: pointer; font-family: 'Material Symbols Outlined'; font-size: 24px; display: flex; align-items: center; gap: 8px; flex: 1;">
+                    <button onclick="openPlaylistIconPicker()" id="playlistIconPickerButton" style="background: rgba(var(--fg-rgb), 0.05); border: 1px solid rgba(var(--fg-rgb), 0.15); color: rgba(var(--fg-rgb), 0.7); padding: 12px 20px; border-radius: 8px; cursor: pointer; font-family: 'Material Symbols Outlined'; font-size: 24px; display: flex; align-items: center; gap: 8px; flex: 1;">
                         <span id="selectedPlaylistIconPreview">queue_music</span>
-                        <span id="selectedPlaylistIconName" style="font-family: 'Inter', sans-serif; font-size: 12px; color: rgba(255,255,255,0.5);">queue_music</span>
+                        <span id="selectedPlaylistIconName" style="font-family: 'Inter', sans-serif; font-size: 12px; color: rgba(var(--fg-rgb), 0.5);">queue_music</span>
                     </button>
                     <input type="hidden" id="newPlaylistIcon" value="queue_music">
                 </div>
@@ -2912,8 +3005,10 @@ function showRoomEditor(mode, roomIdx) {
         roomName: roomData.roomName || '',
         headerTempEntity: roomData.headerTempEntity || '',
         screensaverWeather: roomData.screensaverWeather || '',
+        wakeEntity: roomData.wakeEntity || '',
         gridColumns: roomData.gridColumns || 2,
         gridRows: roomData.gridRows || 2,
+        theme: roomData.theme || '',
         entities: roomData.entities || [],
         assistantCommands: roomData.assistantCommands || [],
         spotifyPlaylists: roomData.spotifyPlaylists || [],
@@ -2959,6 +3054,7 @@ async function saveGlobalSettings() {
     globalConfig.haToken = document.getElementById('haTokenInput').value.trim();
     globalConfig.assistantEntity = document.getElementById('assistantEntityInput').value.trim();
     globalConfig.fontFamily = document.getElementById('fontFamilyInput').value;
+    globalConfig.theme = document.getElementById('themeInput').value;
     globalConfig.deviceModel = document.getElementById('deviceModelInput').value;
     globalConfig.hideVoiceMessages = document.getElementById('hideVoiceMessagesInput').checked;
     globalConfig.disableBuiltInScreensaver = document.getElementById('disableScreensaverInput').checked;
@@ -2991,6 +3087,7 @@ async function saveGlobalSettings() {
     }
 
     applyFontFamily();
+    applyTheme();
     applyDeviceModel();
     applyVoiceMessageVisibility();
     applyHeaderVisibility();
@@ -3008,11 +3105,18 @@ async function saveRoom(mode) {
     const roomName = document.getElementById('roomNameInput').value.trim();
     const headerTempEntity = document.getElementById('headerTempEntityInput').value.trim();
     const screensaverWeather = document.getElementById('screensaverWeatherInput').value.trim();
+    const wakeEntity = document.getElementById('wakeEntityInput').value.trim();
     const gridColumns = parseInt(document.getElementById('gridColumnsInput').value) || 2;
     const gridRows = parseInt(document.getElementById('gridRowsInput').value) || 2;
+    const theme = document.getElementById('roomThemeInput').value;
 
     if (!roomName) {
         showError('Please enter a room name');
+        return;
+    }
+
+    if (wakeEntity && !VALID_ENTITY_ID.test(wakeEntity)) {
+        showError('Wake entity must be a full entity ID, e.g. binary_sensor.bathroom_motion');
         return;
     }
 
@@ -3025,8 +3129,10 @@ async function saveRoom(mode) {
         roomName,
         headerTempEntity,
         screensaverWeather,
+        wakeEntity,
         gridColumns,
         gridRows,
+        theme,
         entities: window.editingRoomData.entities,
         assistantCommands: window.editingRoomData.assistantCommands || [],
         spotifyPlaylists: window.editingRoomData.spotifyPlaylists || []
@@ -3058,6 +3164,7 @@ async function saveRoom(mode) {
     await saveConfig();
 
     closeAdmin();
+    applyTheme();
     
     await startLiveStates();
     renderPages();
@@ -3157,6 +3264,11 @@ function openEntityModal(index) {
         document.getElementById('newEntityDisableAction').checked = entity.disableAction || false;
         document.getElementById('newEntityDisableDimming').checked = entity.disableDimming || false;
         document.getElementById('newEntityDecimals').value = entity.decimals !== undefined ? entity.decimals : '';
+        document.getElementById('newEntityShowGauge').checked = entity.showGauge || false;
+        document.getElementById('newEntityGaugeMin').value = entity.gaugeMin !== undefined ? entity.gaugeMin : '';
+        document.getElementById('newEntityGaugeMax').value = entity.gaugeMax !== undefined ? entity.gaugeMax : '';
+        document.getElementById('newEntityGaugeYellow').value = entity.gaugeYellow !== undefined ? entity.gaugeYellow : '';
+        document.getElementById('newEntityGaugeRed').value = entity.gaugeRed !== undefined ? entity.gaugeRed : '';
         document.getElementById('newEntityHideWeatherName').checked = entity.hideWeatherName || false;
         document.getElementById('newEntityHideWeatherIcon').checked = entity.hideWeatherIcon || false;
         document.getElementById('newEntityHideWeatherForecast').checked = entity.hideWeatherForecast || false;
@@ -3177,6 +3289,11 @@ function openEntityModal(index) {
         document.getElementById('newEntityDisableAction').checked = false;
         document.getElementById('newEntityDisableDimming').checked = false;
         document.getElementById('newEntityDecimals').value = '';
+        document.getElementById('newEntityShowGauge').checked = false;
+        document.getElementById('newEntityGaugeMin').value = '';
+        document.getElementById('newEntityGaugeMax').value = '';
+        document.getElementById('newEntityGaugeYellow').value = '';
+        document.getElementById('newEntityGaugeRed').value = '';
         document.getElementById('newEntityHideWeatherName').checked = false;
         document.getElementById('newEntityHideWeatherIcon').checked = false;
         document.getElementById('newEntityHideWeatherForecast').checked = false;
@@ -3241,6 +3358,17 @@ function saveEntityModal() {
     if (domain === 'sensor') {
         const decimalsRaw = document.getElementById('newEntityDecimals').value;
         if (decimalsRaw !== '') entity.decimals = parseInt(decimalsRaw);
+        if (document.getElementById('newEntityShowGauge').checked) {
+            entity.showGauge = true;
+            const minRaw = document.getElementById('newEntityGaugeMin').value;
+            const maxRaw = document.getElementById('newEntityGaugeMax').value;
+            if (minRaw !== '') entity.gaugeMin = parseFloat(minRaw);
+            if (maxRaw !== '') entity.gaugeMax = parseFloat(maxRaw);
+            const yellowRaw = document.getElementById('newEntityGaugeYellow').value;
+            const redRaw = document.getElementById('newEntityGaugeRed').value;
+            if (yellowRaw !== '') entity.gaugeYellow = parseFloat(yellowRaw);
+            if (redRaw !== '') entity.gaugeRed = parseFloat(redRaw);
+        }
     }
     if (domain === 'clock') {
         if (document.getElementById('newEntityHideClockDate').checked) entity.hideClockDate = true;
@@ -3697,7 +3825,7 @@ async function openWeatherForecast(entityId) {
     
     // Update forecast list
     const forecastList = document.getElementById('weatherForecastList');
-    forecastList.innerHTML = '<div style="text-align: center; padding: 20px; color: rgba(255, 255, 255, 0.5);">Loading forecast...</div>';
+    forecastList.innerHTML = '<div style="text-align: center; padding: 20px; color: rgba(var(--fg-rgb), 0.5);">Loading forecast...</div>';
     
     modal.classList.add('active');
 
@@ -3734,7 +3862,7 @@ async function openWeatherForecast(entityId) {
         
         if (forecastData.length === 0) {
             forecastList.innerHTML = `
-                <div style="text-align: center; padding: 20px; color: rgba(255, 255, 255, 0.5); font-size: 14px;">
+                <div style="text-align: center; padding: 20px; color: rgba(var(--fg-rgb), 0.5); font-size: 14px;">
                     No forecast data available.<br>
                     <small style="font-size: 12px; margin-top: 8px; display: block;">
                         Make sure your weather integration provides forecast data.
@@ -3782,7 +3910,7 @@ async function openWeatherForecast(entityId) {
     } catch (error) {
         console.error('Failed to fetch forecast:', error);
         forecastList.innerHTML = `
-            <div style="text-align: center; padding: 20px; color: rgba(255, 255, 255, 0.5); font-size: 14px;">
+            <div style="text-align: center; padding: 20px; color: rgba(var(--fg-rgb), 0.5); font-size: 14px;">
                 Failed to load forecast data.<br>
                 <small style="font-size: 12px; margin-top: 8px; display: block;">
                     ${error.message || 'Unknown error'}
@@ -3874,6 +4002,7 @@ async function init() {
         const idx = roomConfigs.findIndex(r => r.roomName === roomParam);
         if (idx >= 0) config = { ...globalConfig, ...roomConfigs[idx] };
     }
+    applyTheme();
 
     // Restore admin view from URL params on reload
     if (adminView && (config || globalConfig.haToken)) {
@@ -3993,7 +4122,7 @@ function renderIconGrid(icons) {
     grid.innerHTML = '';
     
     if (icons.length === 0) {
-        grid.innerHTML = '<div style="grid-column: 1 / -1; text-align: center; padding: 20px; color: rgba(255,255,255,0.5);">No icons found</div>';
+        grid.innerHTML = '<div style="grid-column: 1 / -1; text-align: center; padding: 20px; color: rgba(var(--fg-rgb), 0.5);">No icons found</div>';
         return;
     }
     
@@ -4127,6 +4256,13 @@ function applyFontFamily() {
     document.documentElement.style.setProperty('--font-body', font.stack);
 }
 
+// Room theme wins; empty means use the global default
+function applyTheme() {
+    const room = config && roomConfigs.find(r => r.roomName === config.roomName);
+    const theme = room?.theme || globalConfig.theme;
+    document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark';
+}
+
 function applyDeviceModel() {
     document.querySelector('.container').classList.toggle('pro120', globalConfig.deviceModel === 'pro120');
 }
@@ -4187,7 +4323,7 @@ async function openVoiceMessageModal() {
                     </div>
                 `).join('')}
             </div>
-        ` : '<div style="text-align: center; padding: 20px; color: rgba(255,255,255,0.5); font-size: 13px;">No messages</div>'}
+        ` : '<div style="text-align: center; padding: 20px; color: rgba(var(--fg-rgb), 0.5); font-size: 13px;">No messages</div>'}
         
         <div class="voice-record-section">
             <div class="voice-room-buttons">
