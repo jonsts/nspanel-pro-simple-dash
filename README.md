@@ -52,7 +52,13 @@ A modern, touch-friendly Home Assistant dashboard built for NSPanel displays (48
 HA_URL=http://homeassistant.local:8123 node serve.js
 ```
 
-`serve.js` is a self-contained Node server that serves the static files, proxies `/api/*` to Home Assistant, and implements the same config API the PHP backend provides (data is written to `./data/`). Defaults to port 8080; override with `PORT=...`.
+`serve.js` is a self-contained Node server that serves the static files, proxies `/api/*` to Home Assistant (including the `/api/websocket` upgrade), and implements the same config API the PHP backend provides (data is written to `./data/`). Defaults to port 8080; override with `PORT=...`.
+
+## Live State
+
+The dashboard gets entity state over Home Assistant's WebSocket API (`/api/websocket`, proxied through the same origin) and subscribes to only the entities the current room and screensaver show. HA pushes a small diff when one of them changes, and only the affected tiles are redrawn. If the socket can't connect, the dashboard falls back to fetching those entities over REST every 10 seconds. Everything pauses while the page is hidden.
+
+If you put your own reverse proxy in front of the dashboard, it must forward WebSocket upgrades on `/api/websocket` (the bundled nginx config does). The dashboard pings the socket every 20 seconds, so proxies with an idle timeout of 30 seconds or more are fine.
 
 ## Editing the Dashboard Files
 
@@ -92,6 +98,7 @@ Open the editor by long-pressing (~2s) anywhere on the dashboard, or by visiting
 - **Grid columns/rows** — controls entities per page and tile sizing
 - **Header temperature entity** — a `climate` or `sensor` shown in the header with quick controls
 - **Screensaver weather entity** — room-specific weather shown on the screensaver
+- **Wake entity** — e.g. a motion `binary_sensor`; hides the screensaver while it is `on` and keeps it from coming back
 - **Entities** — add, edit, reorder, remove
 - **Assistant commands** — custom voice command tiles (sent via `google_assistant_sdk` to the first media player in the room)
 - **Spotify playlists** — tiles that start a given playlist on the room's media player
@@ -109,7 +116,7 @@ Leaving the room editor with unsaved changes prompts a confirmation before disca
 | `cover` | Toggle; swipe to set position if the entity supports it |
 | `climate` | Opens a modal with current/target temperature and HVAC mode buttons |
 | `scene`, `script`, `automation` | Trigger/activate |
-| `sensor` | Read-only value with unit, optional fixed decimal places |
+| `sensor` | Read-only value with unit, optional fixed decimal places, optional gauge |
 | `weather` | Current condition tile; tap opens a forecast modal; optional inline forecast strip |
 | `media_player` | Tap to play/pause, transport buttons on the tile, full dedicated media page; long-press (800ms) for a Google Assistant voice command prompt |
 
@@ -120,6 +127,7 @@ Leaving the room editor with unsaved changes prompts a confirmation before disca
 - **Disable action** — make the tile display-only (no tap/swipe interaction)
 - **Disable dimming** (`light` only) — toggle-only, no brightness swipe
 - **Decimals** (`sensor` only) — 0–3 fixed decimal places
+- **Show as gauge** (`sensor` only) — semicircle gauge with min/max; optional yellow/red thresholds (green below yellow), otherwise a blue → red gradient
 - **Hide weather name / icon / forecast** (`weather` only)
 - **Full-width row layout** (`weather` only) — icon-left, content-right instead of a square tile
 - **Popup forecast type** (`weather` only) — daily or hourly periods in the tap-to-open forecast modal (default hourly)
@@ -169,6 +177,8 @@ Tap the phone icon in the header to record a short (max 30s) audio message and s
 ## Customization
 
 ### Theming with `custom.css`
+
+Each room can pick Dark or Light in the room editor (falls back to the default theme in Global Settings). Light-mode values live in the `:root[data-theme="light"]` block of `styles.css`; override them in `custom.css` the same way.
 
 Tokens are defined in `styles.css`'s `:root` block and re-declared (commented, as a starting point) in `custom.css.example`. To override any of them without touching the tracked files:
 

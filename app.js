@@ -23,7 +23,8 @@ const DEFAULT_GLOBAL_CONFIG = {
     screensaverTimeFormat: '24h', // '24h' or '12h'
     hideVoiceMessages: false,
     deviceModel: 'pro',
-    fontFamily: 'Inter'
+    fontFamily: 'Inter',
+    theme: 'dark'
 };
 
 // Split entities into pages by simulating the grid's row-major auto-placement
@@ -94,8 +95,8 @@ function paginateEntities(items, gridColumns, gridRows) {
 let config = null;
 let globalConfig = null;
 let roomConfigs = [];
+let gaugeSeq = 0; // unique SVG gradient ids per rendered gauge
 let entityStates = {};
-let pollInterval = null;
 let isConnected = false;
 let currentPage = 0;
 let touchStartX = 0;
@@ -107,6 +108,7 @@ let lastAlbumArtUrl = '';
 let nowPlayingFlipInterval = null;
 let nowPlayingCurrentLine = 0;
 let isSliderDragging = false;
+let isScreensaverOnlyMode = false; // ?screensaver=true: no room, so no voice messages either
 const forecastCache = {};
 const WEATHER_ICONS = {
     'clear-night': 'nightlight',
@@ -255,8 +257,10 @@ async function saveConfig() {
             roomName: config.roomName,
             headerTempEntity: config.headerTempEntity,
             screensaverWeather: config.screensaverWeather,
+            wakeEntity: config.wakeEntity,
             gridColumns: config.gridColumns,
             gridRows: config.gridRows,
+            theme: roomConfigs.find(r => r.roomName === config.roomName)?.theme || '',
             entities: config.entities,
             assistantCommands: config.assistantCommands || [],
             spotifyPlaylists: config.spotifyPlaylists || []
@@ -327,22 +331,16 @@ async function callHA(endpoint, method = 'GET', body = null) {
     return response.json();
 }
 
-async function getStates() {
+// Cheap check that the URL and token work: GET /api/ answers {"message": "API running."}
+async function testHAConnection() {
     try {
-        const states = await callHA('states');
-        const stateMap = {};
-        
-        states.forEach(state => {
-            stateMap[state.entity_id] = state;
-        });
-
-        entityStates = stateMap;
+        await callHA('');
         updateConnectionStatus(true);
-        return stateMap;
+        return true;
     } catch (error) {
-        console.error('Failed to get states:', error);
+        console.error('Failed to reach Home Assistant:', error);
         updateConnectionStatus(false);
-        return null;
+        return false;
     }
 }
 
@@ -351,7 +349,7 @@ async function callService(domain, service, entityId) {
         await callHA(`services/${domain}/${service}`, 'POST', {
             entity_id: entityId
         });
-        setTimeout(() => getStates().then(renderPages), 100);
+        refreshStatesSoon(100);
     } catch (error) {
         console.error('Service call failed:', error);
         showError('Failed to control device');
@@ -359,14 +357,385 @@ async function callService(domain, service, entityId) {
 }
 
 // ============================================
+// LIVE STATE
+// ============================================
+// Live state comes over Home Assistant's WebSocket API (through this origin's
+// /api/ proxy), subscribed to only the entities this page shows, so HA pushes
+// a few hundred bytes per change instead of the panel downloading and parsing
+// every entity in HA (~1 MB on a big install) on a timer. While the socket is
+// down, the same entities are polled one by one over REST every 10 s.
+// Everything stops while the page is hidden.
+const FALLBACK_POLL_MS = 10000;
+const SOCKET_PING_MS = 20000; // keep under nginx's 30 s proxy_read_timeout on older configs
+const NON_HA_DOMAINS = ['clock', 'assistant_command', 'spotify_playlist'];
+// Same rule HA uses; subscribe_entities rejects the whole list if one id is malformed.
+const VALID_ENTITY_ID = /^(?!.+__)(?!_)[\da-z_]+(?<!_)\.(?!_)[\da-z_]+(?<!_)$/;
+
+let liveStatesStarted = false;
+let watchedEntityIds = [];
+let haSocket = null;
+let haSocketLive = false;      // authenticated, subscribed and first snapshot applied
+let haMsgId = 0;
+let haSubscriptionId = null;
+let haRetryMs = 1000;
+let haRetryTimer = null;
+let haPingTimer = null;
+let haPongTimer = null;
+let fallbackPollTimer = null;
+let pollInFlight = null;       // the id list being polled right now
+
+// Entities that need live state: the room's tiles, the header temperature and the screensaver.
+function getWatchedEntityIds() {
+    const ids = (config.entities || [])
+        .map(e => e.id)
+        .filter(id => !NON_HA_DOMAINS.includes(id.split('.')[0]));
+    if (config.headerTempEntity) ids.push(config.headerTempEntity);
+    if (config.screensaverWeather) ids.push(config.screensaverWeather);
+    if (config.wakeEntity) ids.push(config.wakeEntity);
+    return [...new Set(ids)].filter(id => VALID_ENTITY_ID.test(id));
+}
+
+// (Re)starts live state for the current config. Resolves false if Home Assistant can't be reached.
+async function startLiveStates() {
+    closeSocket();
+    stopFallbackPoll();
+    clearTimeout(haRetryTimer);
+    haRetryMs = 1000;
+    liveStatesStarted = true;
+    watchedEntityIds = getWatchedEntityIds();
+    pagesRendered = false;
+
+    const ok = await pollWatchedStates();
+    connectSocket(); // keeps retrying (with the fallback poll) if HA is down right now
+    return ok;
+}
+
+// Stores a state and returns whether anything a tile shows changed.
+function setEntityState(entityId, next) {
+    const prev = entityStates[entityId];
+    entityStates[entityId] = next;
+    return !prev || prev.state !== next.state ||
+        JSON.stringify(prev.attributes) !== JSON.stringify(next.attributes);
+}
+
+async function fetchEntityState(entityId) {
+    const response = await fetch(`/api/states/${encodeURIComponent(entityId)}`, {
+        headers: { 'Authorization': `Bearer ${globalConfig.haToken}` }
+    });
+    if (response.status === 404) return null; // no such entity in HA
+    if (!response.ok) throw new Error(`HA API error: ${response.status}`);
+    return response.json();
+}
+
+// Reads the watched entities over REST, one small request each. Returns false
+// if Home Assistant couldn't be reached at all.
+async function pollWatchedStates() {
+    if (!globalConfig || !globalConfig.haToken) return false;
+    const ids = watchedEntityIds;
+    if (!ids.length || pollInFlight === ids) return true;
+
+    pollInFlight = ids;
+    let results;
+    try {
+        results = await Promise.all(ids.map(id => fetchEntityState(id).then(
+            state => ({ state }),
+            error => ({ error })
+        )));
+    } finally {
+        if (pollInFlight === ids) pollInFlight = null;
+    }
+
+    if (results.every(r => r.error)) {
+        console.error('Failed to get states:', results[0].error);
+        updateConnectionStatus(false);
+        return false;
+    }
+    updateConnectionStatus(true);
+    // The socket came up meanwhile; its snapshot is newer than these responses.
+    if (haSocketLive || ids !== watchedEntityIds) return true;
+
+    const changed = new Set();
+    results.forEach(({ state, error }, i) => {
+        if (error) return;
+        const id = ids[i];
+        if (state) {
+            if (setEntityState(id, state)) changed.add(id);
+        } else if (entityStates[id]) {
+            delete entityStates[id];
+            changed.add(id);
+        }
+    });
+    if (changed.size) onEntitiesChanged(changed);
+    return true;
+}
+
+// After a service call: the socket pushes the new state by itself, so only
+// re-read the entities when it's down.
+function refreshStatesSoon(delay = 500) {
+    if (haSocketLive) return;
+    setTimeout(pollWatchedStates, delay);
+}
+
+function connectSocket() {
+    closeSocket();
+    clearTimeout(haRetryTimer);
+    // An empty entity_ids list would subscribe to every entity in HA.
+    if (!globalConfig || !globalConfig.haToken || !watchedEntityIds.length || document.hidden) return;
+
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    let ws;
+    try {
+        ws = new WebSocket(`${protocol}//${location.host}/api/websocket`);
+    } catch (error) {
+        console.error('WebSocket failed:', error);
+        socketDown();
+        return;
+    }
+    haSocket = ws;
+    ws.onmessage = (event) => {
+        let msg;
+        try { msg = JSON.parse(event.data); } catch (e) { return; }
+        handleSocketMessage(msg);
+    };
+    ws.onclose = () => { if (haSocket === ws) socketDown(); };
+}
+
+function sendSocketMessage(msg) {
+    msg.id = ++haMsgId;
+    haSocket.send(JSON.stringify(msg));
+    return msg.id;
+}
+
+function handleSocketMessage(msg) {
+    switch (msg.type) {
+        case 'auth_required':
+            haSocket.send(JSON.stringify({ type: 'auth', access_token: globalConfig.haToken }));
+            break;
+        case 'auth_ok':
+            haSubscriptionId = sendSocketMessage({ type: 'subscribe_entities', entity_ids: watchedEntityIds });
+            break;
+        case 'auth_invalid':
+            console.error('Home Assistant rejected the token:', msg.message);
+            socketDown();
+            break;
+        case 'result':
+            if (msg.id === haSubscriptionId && !msg.success) {
+                console.error('subscribe_entities failed:', msg.error);
+                socketDown();
+            }
+            break;
+        case 'pong':
+            clearTimeout(haPongTimer);
+            break;
+        case 'event':
+            if (msg.id === haSubscriptionId) applyEntityEvent(msg.event);
+            break;
+    }
+}
+
+// subscribe_entities sends compressed states: `a` = full states (the first
+// event, and entities that show up later), `c` = diffs ('+' changed fields,
+// '-' removed attributes), `r` = removed entities.
+function applyEntityEvent(event) {
+    const changed = new Set();
+    const added = event.a || {};
+
+    for (const id of Object.keys(added)) {
+        const s = added[id];
+        if (setEntityState(id, { entity_id: id, state: s.s, attributes: s.a || {} })) changed.add(id);
+    }
+    for (const id of Object.keys(event.c || {})) {
+        const current = entityStates[id];
+        if (!current) continue;
+        const plus = event.c[id]['+'] || {};
+        const minus = (event.c[id]['-'] && event.c[id]['-'].a) || [];
+        if (!('s' in plus) && !plus.a && !minus.length) continue; // only timestamps/context changed
+        const attributes = { ...current.attributes, ...(plus.a || {}) };
+        minus.forEach(key => delete attributes[key]);
+        entityStates[id] = { ...current, state: 's' in plus ? plus.s : current.state, attributes };
+        changed.add(id);
+    }
+    for (const id of event.r || []) {
+        if (!entityStates[id]) continue;
+        delete entityStates[id];
+        changed.add(id);
+    }
+
+    if (!haSocketLive) {
+        // First event is the full snapshot: anything missing from it is gone from HA.
+        for (const id of watchedEntityIds) {
+            if (!(id in added) && entityStates[id]) {
+                delete entityStates[id];
+                changed.add(id);
+            }
+        }
+        haSocketLive = true;
+        haRetryMs = 1000;
+        stopFallbackPoll();
+        startSocketPing();
+        updateConnectionStatus(true);
+    }
+    if (changed.size) onEntitiesChanged(changed);
+}
+
+// Pings keep idle proxies from closing the socket and catch dead ones (common
+// after the screen has been off), which are then reconnected.
+function startSocketPing() {
+    clearInterval(haPingTimer);
+    haPingTimer = setInterval(() => {
+        if (!haSocket || haSocket.readyState !== WebSocket.OPEN) {
+            socketDown();
+            return;
+        }
+        sendSocketMessage({ type: 'ping' });
+        clearTimeout(haPongTimer);
+        haPongTimer = setTimeout(socketDown, 10000);
+    }, SOCKET_PING_MS);
+}
+
+function socketDown() {
+    closeSocket();
+    if (document.hidden || !watchedEntityIds.length) return;
+    startFallbackPoll();
+    clearTimeout(haRetryTimer);
+    haRetryTimer = setTimeout(connectSocket, haRetryMs);
+    haRetryMs = Math.min(haRetryMs * 2, 30000);
+}
+
+function closeSocket() {
+    clearInterval(haPingTimer);
+    clearTimeout(haPongTimer);
+    haSocketLive = false;
+    haSubscriptionId = null;
+    if (haSocket) {
+        const ws = haSocket;
+        haSocket = null;
+        ws.onclose = ws.onmessage = null;
+        try { ws.close(); } catch (e) { /* already closed */ }
+    }
+}
+
+function startFallbackPoll() {
+    if (fallbackPollTimer || document.hidden) return;
+    fallbackPollTimer = setInterval(pollWatchedStates, FALLBACK_POLL_MS);
+}
+
+function stopFallbackPoll() {
+    clearInterval(fallbackPollTimer);
+    fallbackPollTimer = null;
+}
+
+function pauseLiveStates() {
+    closeSocket();
+    stopFallbackPoll();
+    clearTimeout(haRetryTimer);
+    clearTimeout(clockTileTimer);
+}
+
+function resumeLiveStates() {
+    if (!liveStatesStarted) return;
+    flushPendingRenders();
+    updateClockTiles();
+    haRetryMs = 1000;
+    if (!haSocket) connectSocket();
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) pauseLiveStates();
+    else resumeLiveStates();
+});
+
+// A cancelled touch never reaches the slider's touchend, so release the render hold here.
+document.addEventListener('touchcancel', () => {
+    if (isSliderDragging) endSliderDrag();
+}, true);
+
+// ============================================
 // UI RENDERING
 // ============================================
+// renderPages() builds every page once; after that, state changes only
+// replace the tiles (and header, media page, open modal) that show the
+// changed entities.
+let pagesRendered = false;
+let renderedTiles = new Map(); // entity id -> [{ entity, tile }]
+let pendingRenderIds = new Set();
+let clockTileTimer = null;
+
+function onEntitiesChanged(changedIds) {
+    if (changedIds.has(config.wakeEntity) && isWakeEntityOn() &&
+        document.getElementById('screensaver').classList.contains('active')) {
+        exitScreensaver();
+    }
+    changedIds.forEach(id => pendingRenderIds.add(id));
+    // Don't re-render while a slider is being dragged; endSliderDrag() catches up.
+    if (isSliderDragging || document.hidden) return;
+    flushPendingRenders();
+}
+
+function flushPendingRenders() {
+    if (!pendingRenderIds.size || isSliderDragging) return;
+    const ids = pendingRenderIds;
+    pendingRenderIds = new Set();
+
+    if (document.getElementById('screensaver').classList.contains('active')) {
+        updateScreensaverClock();
+    }
+    if (!pagesRendered) return;
+
+    ids.forEach(rerenderTiles);
+    if (config.headerTempEntity && ids.has(config.headerTempEntity)) updateHeaderTemp();
+    if ([...ids].some(id => id.startsWith('media_player.'))) rerenderMediaPage();
+    if (currentClimateEntity && ids.has(currentClimateEntity)) openClimateModal(currentClimateEntity);
+}
+
+function rerenderTiles(entityId) {
+    (renderedTiles.get(entityId) || []).forEach(ref => {
+        const tile = createTile(ref.entity, entityStates[entityId]);
+        applyTileSize(tile, ref.entity);
+        ref.tile.replaceWith(tile);
+        ref.tile = tile;
+    });
+}
+
+function rerenderMediaPage() {
+    const mediaPlayers = config.entities.filter(e => e.id.startsWith('media_player.'));
+    const oldPage = document.querySelector('#pagesWrapper .media-player-page');
+    if (oldPage && mediaPlayers.length) oldPage.replaceWith(createMediaPlayerPage(mediaPlayers));
+    updateNowPlayingIndicator(mediaPlayers);
+}
+
+// Clock tiles show hours and minutes, so redraw them on each minute boundary.
+function getClockTileIds() {
+    return [...renderedTiles.keys()].filter(id => id.startsWith('clock.'));
+}
+
+function updateClockTiles() {
+    getClockTileIds().forEach(rerenderTiles);
+    scheduleClockTiles();
+}
+
+function scheduleClockTiles() {
+    clearTimeout(clockTileTimer);
+    if (!pagesRendered || document.hidden || !getClockTileIds().length) return;
+    clockTileTimer = setTimeout(updateClockTiles, 60000 - Date.now() % 60000 + 50);
+}
+
+function endSliderDrag() {
+    isSliderDragging = false;
+    // Give HA a moment to push the value the slider just set, so the tile
+    // doesn't flash back to the old one first.
+    if (pendingRenderIds.size) setTimeout(flushPendingRenders, 1000);
+}
+
 function renderPages() {
     document.getElementById('loadingOverlay').classList.add('hidden');
     const wrapper = document.getElementById('pagesWrapper');
     const dotsContainer = document.getElementById('pageDots');
     wrapper.innerHTML = '';
     dotsContainer.innerHTML = '';
+    renderedTiles = new Map();
+    pendingRenderIds = new Set();
+    pagesRendered = true;
 
     // Filter out media players from regular entities
     const regularEntities = config.entities.filter(e => !e.id.startsWith('media_player.'));
@@ -424,6 +793,8 @@ function renderPages() {
             const tile = createTile(entity, state);
             applyTileSize(tile, entity);
             grid.appendChild(tile);
+            if (!renderedTiles.has(entity.id)) renderedTiles.set(entity.id, []);
+            renderedTiles.get(entity.id).push({ entity, tile });
         }
 
         page.appendChild(grid);
@@ -452,6 +823,7 @@ function renderPages() {
     updateHeaderTemp();
     updateNowPlayingIndicator(mediaPlayers);
     updatePagePosition();
+    scheduleClockTiles();
 }
 
 function createMediaPlayerPage(mediaPlayers) {
@@ -620,7 +992,7 @@ function createMediaPlayerPage(mediaPlayers) {
                 entity_id: activePlayer.id,
                 shuffle: !isShuffle
             }).catch(err => console.error('Shuffle failed:', err));
-            setTimeout(() => getStates().then(renderPages), 500);
+            refreshStatesSoon(500);
         };
 
         const prevBtn = document.createElement('button');
@@ -647,7 +1019,7 @@ function createMediaPlayerPage(mediaPlayers) {
                         media_player: activePlayer.id
                     });
                     console.log('Command sent successfully');
-                    setTimeout(() => getStates().then(renderPages), 2000);
+                    refreshStatesSoon(2000);
                 } catch (err) {
                     console.error('Failed to start Spotify:', err);
                     showError('Failed to start Spotify');
@@ -656,7 +1028,7 @@ function createMediaPlayerPage(mediaPlayers) {
             }
             
             callService('media_player', 'media_play_pause', activePlayer.id);
-            setTimeout(() => getStates().then(renderPages), 1500);
+            refreshStatesSoon(1500);
         };
 
         const nextBtn = document.createElement('button');
@@ -677,7 +1049,7 @@ function createMediaPlayerPage(mediaPlayers) {
                 entity_id: activePlayer.id,
                 repeat: nextMode
             }).catch(err => console.error('Repeat failed:', err));
-            setTimeout(() => getStates().then(renderPages), 500);
+            refreshStatesSoon(500);
         };
 
         controls.appendChild(shuffleBtn);
@@ -714,6 +1086,7 @@ function createMediaPlayerPage(mediaPlayers) {
         };
         volumeTrack.addEventListener('touchstart', (e) => {
             isDraggingVolume = true;
+            isSliderDragging = true;
             updateVolume(e);
             e.preventDefault();
         }, { passive: false });
@@ -730,9 +1103,10 @@ function createMediaPlayerPage(mediaPlayers) {
                     entity_id: activePlayer.id,
                     volume_level: Math.round(pct * 100) / 100
                 }).catch(err => console.error('Volume failed:', err));
-                setTimeout(() => getStates().then(renderPages), 500);
+                refreshStatesSoon(500);
             }
             isDraggingVolume = false;
+            endSliderDrag();
         });
         volumeTrack.addEventListener('click', (e) => {
             const pct = updateVolume(e);
@@ -740,7 +1114,7 @@ function createMediaPlayerPage(mediaPlayers) {
                 entity_id: activePlayer.id,
                 volume_level: Math.round(pct * 100) / 100
             }).catch(err => console.error('Volume failed:', err));
-            setTimeout(() => getStates().then(renderPages), 500);
+            refreshStatesSoon(500);
         });
 
         volumeContainer.appendChild(volumeIcon);
@@ -1169,7 +1543,7 @@ async function playSpotifyPlaylistOnRoomDevice(playlistUrl) {
             console.log('Playing directly on Spotify entity:', payload);
             await callHA('services/media_player/play_media', 'POST', payload);
             showError(`Playing on ${targetDevice.label}...`);
-            setTimeout(() => getStates().then(renderPages), 2000);
+            refreshStatesSoon(2000);
             return;
         }
         
@@ -1184,7 +1558,7 @@ async function playSpotifyPlaylistOnRoomDevice(playlistUrl) {
         console.log('Payload:', payload);
         await callHA('services/media_player/play_media', 'POST', payload);
         showError(`Playing on ${targetDevice.label}...`);
-        setTimeout(() => getStates().then(renderPages), 2000);
+        refreshStatesSoon(2000);
         
     } catch (error) {
         console.error('Failed to play Spotify playlist:', error);
@@ -1211,7 +1585,7 @@ async function sendAssistantCommand(command) {
         });
         
         showError(`Sent to ${mediaPlayers[0].label}: "${command}"`);
-        setTimeout(() => getStates().then(renderPages), 1000);
+        refreshStatesSoon(1000);
     } catch (error) {
         console.error('Failed to send assistant command:', error);
         showError(`Failed: ${error.message || 'Check Google Assistant SDK integration'}`);
@@ -1335,7 +1709,7 @@ function createLightTile(entity, state) {
                 e.preventDefault(); // block synthetic click after a swipe
             }
 
-            isSliderDragging = false;
+            endSliderDrag();
             isSwiping = false;
         }, { passive: false });
 
@@ -1359,7 +1733,7 @@ async function setBrightness(entityId, brightness) {
                 brightness: brightness
             });
         }
-        setTimeout(() => getStates().then(renderPages), 100);
+        refreshStatesSoon(100);
     } catch (error) {
         console.error('Failed to set brightness:', error);
         showError('Failed to set brightness');
@@ -1483,7 +1857,7 @@ function createCoverTile(entity, state) {
                 e.preventDefault(); // block synthetic click after a swipe
             }
 
-            isSliderDragging = false;
+            endSliderDrag();
             isSwiping = false;
         }, { passive: false });
 
@@ -1501,7 +1875,7 @@ async function setCoverPosition(entityId, position) {
             entity_id: entityId,
             position: position
         });
-        setTimeout(() => getStates().then(renderPages), 100);
+        refreshStatesSoon(100);
     } catch (error) {
         console.error('Failed to set cover position:', error);
         showError('Failed to set cover position');
@@ -1615,7 +1989,58 @@ function createSensorTile(entity, state) {
     }
 
     tile.appendChild(label);
-    tile.appendChild(tempDisplay);
+
+    if (entity.showGauge) {
+        // Semicircle (center 50,50, r 40): gradient sectors, tick marks, pointer at the value.
+        // f is the 0..1 fraction of the sweep, left → right.
+        const min = entity.gaugeMin ?? 0;
+        const max = entity.gaugeMax ?? 100;
+        const value = state ? parseFloat(state.state) : NaN;
+        const toF = v => max <= min ? 0 : Math.min(1, Math.max(0, (v - min) / (max - min)));
+        const f = isNaN(value) ? 0 : toF(value);
+        const pt = (f, r) => [50 - r * Math.cos(f * Math.PI), 50 - r * Math.sin(f * Math.PI)].map(n => n.toFixed(2));
+        const arc = (a, b, r) => `M${pt(a, r)} A${r} ${r} 0 0 1 ${pt(b, r)}`;
+
+        // Sector bounds + colors: thresholds if set, otherwise four bands blue → red
+        const thresholds = [entity.gaugeYellow, entity.gaugeRed];
+        const bounds = thresholds.some(t => t !== undefined)
+            ? [0, ...thresholds.filter(t => t !== undefined).map(toF), 1]
+            : [0, 0.25, 0.5, 0.75, 1];
+        const colors = thresholds.some(t => t !== undefined)
+            ? ['#66bb6a', entity.gaugeYellow !== undefined && '#ffca28', entity.gaugeRed !== undefined && '#ef5350'].filter(Boolean)
+            : ['#42a5f5', '#66bb6a', '#ffca28', '#ef5350'];
+        // Gradient runs along x, so convert each sector's middle to its x offset on the arc
+        const stops = colors.map((c, i) => {
+            const mid = (bounds[i] + bounds[i + 1]) / 2;
+            return `<stop offset="${((1 - Math.cos(mid * Math.PI)) / 2).toFixed(3)}" stop-color="${c}"/>`;
+        }).join('');
+        const gap = 0.012;
+        // Sectors drawn dim in full, then bright up to the value
+        const sectorPaths = upTo => colors.map((_, i) => {
+            const a = bounds[i] + (i ? gap : 0);
+            const b = Math.min(bounds[i + 1] - (i < colors.length - 1 ? gap : 0), upTo);
+            return b > a ? `<path d="${arc(a, b, 40)}"/>` : '';
+        }).join('');
+        const ticks = Array.from({ length: 21 }, (_, i) =>
+            `<path d="M${pt(i / 20, 34)} L${pt(i / 20, i % 5 ? 32 : 30)}" class="${i % 5 ? '' : 'major'}"/>`
+        ).join('');
+        const gradId = `gauge-grad-${++gaugeSeq}`;
+
+        const gauge = document.createElement('div');
+        gauge.className = 'sensor-gauge';
+        gauge.innerHTML = `
+            <svg viewBox="0 0 100 56" aria-hidden="true">
+                <defs><linearGradient id="${gradId}" gradientUnits="userSpaceOnUse" x1="10" y1="0" x2="90" y2="0">${stops}</linearGradient></defs>
+                <g class="gauge-sectors" stroke="url(#${gradId})">${sectorPaths(1)}</g>
+                <g class="gauge-sectors gauge-fill" stroke="url(#${gradId})">${sectorPaths(f)}</g>
+                <g class="gauge-ticks">${ticks}</g>
+                ${isNaN(value) ? '' : `<path class="gauge-pointer" d="M${pt(f, 45)} L${pt(f, 31)}"/><circle class="gauge-knob" cx="${pt(f, 40)[0]}" cy="${pt(f, 40)[1]}" r="2.6"/>`}
+            </svg>`;
+        gauge.appendChild(tempDisplay);
+        tile.appendChild(gauge);
+    } else {
+        tile.appendChild(tempDisplay);
+    }
 
     return tile;
 }
@@ -1861,7 +2286,7 @@ async function playSpotifyPlaylist(entityId, playlistUrl) {
             media_content_id: playlistUrl
         });
         showError('Playing Spotify playlist...');
-        setTimeout(() => getStates().then(renderPages), 1500);
+        refreshStatesSoon(1500);
     } catch (error) {
         console.error('Failed to play Spotify playlist:', error);
         showError('Failed to play playlist. Make sure Spotify is configured.');
@@ -1891,7 +2316,7 @@ async function adjustTemperature(entityId, delta) {
                 entity_id: entityId,
                 temperature: newTemp
             });
-            setTimeout(() => getStates().then(renderPages), 100);
+            refreshStatesSoon(100);
         } catch (error) {
             console.error('Failed to set temperature:', error);
             showError('Failed to set temperature');
@@ -2082,7 +2507,16 @@ function resetInactivityTimer() {
     inactivityTimer = setTimeout(enterScreensaver, timeout);
 }
 
+function isWakeEntityOn() {
+    return !!config.wakeEntity && entityStates[config.wakeEntity]?.state === 'on';
+}
+
 function enterScreensaver() {
+    // Stay awake while the room's motion sensor still reports presence
+    if (isWakeEntityOn()) {
+        resetInactivityTimer();
+        return;
+    }
     document.getElementById('screensaver').classList.add('active');
     updateScreensaverClock();
     screensaverClockInterval = setInterval(updateScreensaverClock, 1000);
@@ -2108,11 +2542,21 @@ function formatClockTime(date, formatOverride) {
     return `${hours}:${minutes}`;
 }
 
+// Runs every second, so only touch the DOM when a value actually changed
+// (rewriting text or styles forces style and layout work on the panel).
+function setTextIfChanged(element, text) {
+    if (element.textContent !== text) element.textContent = text;
+}
+
+function setDisplayIfChanged(element, display) {
+    if (element.style.display !== display) element.style.display = display;
+}
+
 function updateScreensaverClock() {
     const now = new Date();
 
     // Time
-    document.getElementById('screensaverTime').textContent = formatClockTime(now);
+    setTextIfChanged(document.getElementById('screensaverTime'), formatClockTime(now));
 
     // Date
     const days = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
@@ -2120,15 +2564,15 @@ function updateScreensaverClock() {
     const dayName = days[now.getDay()];
     const monthName = months[now.getMonth()];
     const date = now.getDate();
-    document.getElementById('screensaverDate').textContent = `${dayName}, ${monthName} ${date}`;
+    setTextIfChanged(document.getElementById('screensaverDate'), `${dayName}, ${monthName} ${date}`);
     
     // Room name (hide in standalone screensaver mode)
     const roomElement = document.getElementById('screensaverRoom');
     if (config.roomName === 'Screensaver') {
-        roomElement.style.display = 'none';
+        setDisplayIfChanged(roomElement, 'none');
     } else {
-        roomElement.textContent = config.roomName;
-        roomElement.style.display = 'block';
+        setTextIfChanged(roomElement, config.roomName);
+        setDisplayIfChanged(roomElement, 'block');
     }
     
     // Temperature
@@ -2140,20 +2584,20 @@ function updateScreensaverClock() {
         if (domain === 'climate' && state.attributes.current_temperature !== undefined) {
             const temp = Math.round(state.attributes.current_temperature);
             const unit = state.attributes.unit_of_measurement || '°C';
-            tempElement.textContent = `${temp}${unit}`;
-            tempElement.style.display = 'block';
+            setTextIfChanged(tempElement, `${temp}${unit}`);
+            setDisplayIfChanged(tempElement, 'block');
         } else if (domain === 'sensor') {
             const value = parseFloat(state.state);
             if (!isNaN(value)) {
                 const unit = state.attributes.unit_of_measurement || '°C';
-                tempElement.textContent = `${Math.round(value)}${unit}`;
-                tempElement.style.display = 'block';
+                setTextIfChanged(tempElement, `${Math.round(value)}${unit}`);
+                setDisplayIfChanged(tempElement, 'block');
             }
         } else {
-            tempElement.style.display = 'none';
+            setDisplayIfChanged(tempElement, 'none');
         }
     } else {
-        tempElement.style.display = 'none';
+        setDisplayIfChanged(tempElement, 'none');
     }
     
     // Weather
@@ -2165,19 +2609,19 @@ function updateScreensaverClock() {
     if (config.screensaverWeather && entityStates[config.screensaverWeather]) {
         const weatherState = entityStates[config.screensaverWeather];
         
-        weatherIcon.textContent = WEATHER_ICONS[weatherState.state] || 'cloud';
+        setTextIfChanged(weatherIcon, WEATHER_ICONS[weatherState.state] || 'cloud');
         
         // Show weather temperature
         if (weatherState.attributes.temperature !== undefined) {
             const temp = Math.round(weatherState.attributes.temperature);
             const unit = weatherState.attributes.temperature_unit || '°C';
-            weatherTemp.textContent = `${temp}${unit}`;
+            setTextIfChanged(weatherTemp, `${temp}${unit}`);
         }
         
-        weatherCondition.textContent = formatWeatherCondition(weatherState.state);
-        weatherElement.style.display = 'flex';
+        setTextIfChanged(weatherCondition, formatWeatherCondition(weatherState.state));
+        setDisplayIfChanged(weatherElement, 'flex');
     } else {
-        weatherElement.style.display = 'none';
+        setDisplayIfChanged(weatherElement, 'none');
     }
 }
 
@@ -2257,7 +2701,7 @@ function showRoomManager() {
         <div class="error-message" id="errorMessage"></div>
 
         ${!config && hasRooms ? `
-        <div style="background: rgba(99, 179, 237, 0.15); border: 1px solid rgba(99, 179, 237, 0.4); border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; color: rgba(255,255,255,0.85); font-size: 13px;">
+        <div style="background: rgba(99, 179, 237, 0.15); border: 1px solid rgba(99, 179, 237, 0.4); border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; color: rgba(var(--fg-rgb), 0.85); font-size: 13px;">
             Select a room for this panel to get started.
         </div>` : ''}
 
@@ -2277,7 +2721,7 @@ function showRoomManager() {
 
         <button class="add-btn" style="width: 100%; margin-bottom: 24px;" onclick="showRoomEditor('new')">+ New Room</button>
 
-        <div style="border-top: 1px solid rgba(255, 255, 255, 0.1); padding-top: 20px; margin-top: 4px;">
+        <div style="border-top: 1px solid rgba(var(--fg-rgb), 0.1); padding-top: 20px; margin-top: 4px;">
             <button class="save-btn" style="background: linear-gradient(135deg, #666 0%, #444 100%);" onclick="showGlobalSettings()">Global Settings</button>
         </div>
     `;
@@ -2337,6 +2781,13 @@ function showGlobalSettings() {
                 </select>
             </div>
             <div class="form-group">
+                <label class="form-label">Default Theme</label>
+                <select class="form-input" id="themeInput">
+                    <option value="dark" ${globalConfig.theme !== 'light' ? 'selected' : ''}>Dark</option>
+                    <option value="light" ${globalConfig.theme === 'light' ? 'selected' : ''}>Light</option>
+                </select>
+            </div>
+            <div class="form-group">
                 <label class="form-label">Font Family</label>
                 <select class="form-input" id="fontFamilyInput">
                     ${Object.keys(FONT_OPTIONS).map(name =>
@@ -2386,7 +2837,7 @@ function showGlobalSettings() {
                 </label>
                 <small style="color: #888; font-size: 12px; display: block; margin-top: 4px;">
                     Use if you prefer Fully Kiosk's screensaver instead.<br>
-                    <strong>Standalone URL:</strong> <code style="background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px;">${window.location.origin}/?screensaver=true</code>
+                    <strong>Standalone URL:</strong> <code style="background: rgba(var(--fg-rgb), 0.1); padding: 2px 6px; border-radius: 4px;">${window.location.origin}/?screensaver=true</code>
                 </small>
             </div>
         </div>
@@ -2418,8 +2869,10 @@ function getRoomEditorCurrentState() {
         roomName: document.getElementById('roomNameInput')?.value.trim() || '',
         headerTempEntity: document.getElementById('headerTempEntityInput')?.value.trim() || '',
         screensaverWeather: document.getElementById('screensaverWeatherInput')?.value.trim() || '',
+        wakeEntity: document.getElementById('wakeEntityInput')?.value.trim() || '',
         gridColumns: parseInt(document.getElementById('gridColumnsInput')?.value) || 2,
         gridRows: parseInt(document.getElementById('gridRowsInput')?.value) || 2,
+        theme: document.getElementById('roomThemeInput')?.value || '',
         entities: window.editingRoomData?.entities || [],
         assistantCommands: window.editingRoomData?.assistantCommands || [],
         spotifyPlaylists: window.editingRoomData?.spotifyPlaylists || [],
@@ -2488,6 +2941,15 @@ function showRoomEditor(mode, roomIdx) {
         </div>
 
         <div class="form-group">
+            <label class="form-label">Theme</label>
+            <select class="form-input" id="roomThemeInput">
+                <option value="" ${!roomData.theme ? 'selected' : ''}>Global default</option>
+                <option value="dark" ${roomData.theme === 'dark' ? 'selected' : ''}>Dark</option>
+                <option value="light" ${roomData.theme === 'light' ? 'selected' : ''}>Light</option>
+            </select>
+        </div>
+
+        <div class="form-group">
             <label class="form-label">Header Temperature Entity (Optional)</label>
             <input type="text" class="form-input" id="headerTempEntityInput" placeholder="climate.bedroom or sensor.bedroom_temperature" value="${roomData.headerTempEntity || ''}">
             <small style="color: #888; font-size: 12px;">Shows temperature in header with controls for climate entities</small>
@@ -2497,6 +2959,12 @@ function showRoomEditor(mode, roomIdx) {
             <label class="form-label">Screensaver Weather Entity (Optional)</label>
             <input type="text" class="form-input" id="screensaverWeatherInput" placeholder="weather.home" value="${roomData.screensaverWeather || ''}">
             <small style="color: #888; font-size: 12px;">Shows weather on screensaver</small>
+        </div>
+
+        <div class="form-group">
+            <label class="form-label">Wake Entity (Optional)</label>
+            <input type="text" class="form-input" id="wakeEntityInput" placeholder="binary_sensor.bathroom_motion" value="${(roomData.wakeEntity || '').replace(/[&"<>]/g, c => `&#${c.charCodeAt(0)};`)}">
+            <small style="color: #888; font-size: 12px;">Hides the screensaver while this entity is "on" (e.g. a motion sensor)</small>
         </div>
 
         <div class="form-group">
@@ -2525,9 +2993,9 @@ function showRoomEditor(mode, roomIdx) {
                 <input type="text" class="form-input" id="newPlaylistUrl" placeholder="https://open.spotify.com/playlist/... or spotify:playlist:...">
                 <div style="display: flex; gap: 8px; align-items: center;">
                     <label class="form-label" style="margin: 0; min-width: 40px;">Icon:</label>
-                    <button onclick="openPlaylistIconPicker()" id="playlistIconPickerButton" style="background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.15); color: rgba(255,255,255,0.7); padding: 12px 20px; border-radius: 8px; cursor: pointer; font-family: 'Material Symbols Outlined'; font-size: 24px; display: flex; align-items: center; gap: 8px; flex: 1;">
+                    <button onclick="openPlaylistIconPicker()" id="playlistIconPickerButton" style="background: rgba(var(--fg-rgb), 0.05); border: 1px solid rgba(var(--fg-rgb), 0.15); color: rgba(var(--fg-rgb), 0.7); padding: 12px 20px; border-radius: 8px; cursor: pointer; font-family: 'Material Symbols Outlined'; font-size: 24px; display: flex; align-items: center; gap: 8px; flex: 1;">
                         <span id="selectedPlaylistIconPreview">queue_music</span>
-                        <span id="selectedPlaylistIconName" style="font-family: 'Inter', sans-serif; font-size: 12px; color: rgba(255,255,255,0.5);">queue_music</span>
+                        <span id="selectedPlaylistIconName" style="font-family: 'Inter', sans-serif; font-size: 12px; color: rgba(var(--fg-rgb), 0.5);">queue_music</span>
                     </button>
                     <input type="hidden" id="newPlaylistIcon" value="queue_music">
                 </div>
@@ -2623,8 +3091,10 @@ function showRoomEditor(mode, roomIdx) {
         roomName: roomData.roomName || '',
         headerTempEntity: roomData.headerTempEntity || '',
         screensaverWeather: roomData.screensaverWeather || '',
+        wakeEntity: roomData.wakeEntity || '',
         gridColumns: roomData.gridColumns || 2,
         gridRows: roomData.gridRows || 2,
+        theme: roomData.theme || '',
         entities: roomData.entities || [],
         assistantCommands: roomData.assistantCommands || [],
         spotifyPlaylists: roomData.spotifyPlaylists || [],
@@ -2657,8 +3127,7 @@ async function saveGlobalAndContinue() {
     await saveGlobalConfig();
     
     // Test connection
-    const states = await getStates();
-    if (!states) {
+    if (!await testHAConnection()) {
         showError('Failed to connect to Home Assistant. Check your URL and token.');
         return;
     }
@@ -2671,6 +3140,7 @@ async function saveGlobalSettings() {
     globalConfig.haToken = document.getElementById('haTokenInput').value.trim();
     globalConfig.assistantEntity = document.getElementById('assistantEntityInput').value.trim();
     globalConfig.fontFamily = document.getElementById('fontFamilyInput').value;
+    globalConfig.theme = document.getElementById('themeInput').value;
     globalConfig.deviceModel = document.getElementById('deviceModelInput').value;
     globalConfig.hideVoiceMessages = document.getElementById('hideVoiceMessagesInput').checked;
     globalConfig.disableBuiltInScreensaver = document.getElementById('disableScreensaverInput').checked;
@@ -2703,13 +3173,13 @@ async function saveGlobalSettings() {
     }
 
     applyFontFamily();
+    applyTheme();
     applyDeviceModel();
     applyVoiceMessageVisibility();
     applyHeaderVisibility();
 
     // Test connection
-    const states = await getStates();
-    if (!states) {
+    if (!await testHAConnection()) {
         showError('Failed to connect to Home Assistant. Check your URL and token.');
         return;
     }
@@ -2721,11 +3191,18 @@ async function saveRoom(mode) {
     const roomName = document.getElementById('roomNameInput').value.trim();
     const headerTempEntity = document.getElementById('headerTempEntityInput').value.trim();
     const screensaverWeather = document.getElementById('screensaverWeatherInput').value.trim();
+    const wakeEntity = document.getElementById('wakeEntityInput').value.trim();
     const gridColumns = parseInt(document.getElementById('gridColumnsInput').value) || 2;
     const gridRows = parseInt(document.getElementById('gridRowsInput').value) || 2;
+    const theme = document.getElementById('roomThemeInput').value;
 
     if (!roomName) {
         showError('Please enter a room name');
+        return;
+    }
+
+    if (wakeEntity && !VALID_ENTITY_ID.test(wakeEntity)) {
+        showError('Wake entity must be a full entity ID, e.g. binary_sensor.bathroom_motion');
         return;
     }
 
@@ -2738,8 +3215,10 @@ async function saveRoom(mode) {
         roomName,
         headerTempEntity,
         screensaverWeather,
+        wakeEntity,
         gridColumns,
         gridRows,
+        theme,
         entities: window.editingRoomData.entities,
         assistantCommands: window.editingRoomData.assistantCommands || [],
         spotifyPlaylists: window.editingRoomData.spotifyPlaylists || []
@@ -2771,12 +3250,10 @@ async function saveRoom(mode) {
     await saveConfig();
 
     closeAdmin();
+    applyTheme();
     
-    const states = await getStates();
-    if (states) {
-        renderPages();
-        startPolling();
-    }
+    await startLiveStates();
+    renderPages();
 }
 
 async function deleteSelectedRoom() {
@@ -2873,6 +3350,11 @@ function openEntityModal(index) {
         document.getElementById('newEntityDisableAction').checked = entity.disableAction || false;
         document.getElementById('newEntityDisableDimming').checked = entity.disableDimming || false;
         document.getElementById('newEntityDecimals').value = entity.decimals !== undefined ? entity.decimals : '';
+        document.getElementById('newEntityShowGauge').checked = entity.showGauge || false;
+        document.getElementById('newEntityGaugeMin').value = entity.gaugeMin !== undefined ? entity.gaugeMin : '';
+        document.getElementById('newEntityGaugeMax').value = entity.gaugeMax !== undefined ? entity.gaugeMax : '';
+        document.getElementById('newEntityGaugeYellow').value = entity.gaugeYellow !== undefined ? entity.gaugeYellow : '';
+        document.getElementById('newEntityGaugeRed').value = entity.gaugeRed !== undefined ? entity.gaugeRed : '';
         document.getElementById('newEntityHideWeatherName').checked = entity.hideWeatherName || false;
         document.getElementById('newEntityHideWeatherIcon').checked = entity.hideWeatherIcon || false;
         document.getElementById('newEntityHideWeatherForecast').checked = entity.hideWeatherForecast || false;
@@ -2893,6 +3375,11 @@ function openEntityModal(index) {
         document.getElementById('newEntityDisableAction').checked = false;
         document.getElementById('newEntityDisableDimming').checked = false;
         document.getElementById('newEntityDecimals').value = '';
+        document.getElementById('newEntityShowGauge').checked = false;
+        document.getElementById('newEntityGaugeMin').value = '';
+        document.getElementById('newEntityGaugeMax').value = '';
+        document.getElementById('newEntityGaugeYellow').value = '';
+        document.getElementById('newEntityGaugeRed').value = '';
         document.getElementById('newEntityHideWeatherName').checked = false;
         document.getElementById('newEntityHideWeatherIcon').checked = false;
         document.getElementById('newEntityHideWeatherForecast').checked = false;
@@ -2957,6 +3444,17 @@ function saveEntityModal() {
     if (domain === 'sensor') {
         const decimalsRaw = document.getElementById('newEntityDecimals').value;
         if (decimalsRaw !== '') entity.decimals = parseInt(decimalsRaw);
+        if (document.getElementById('newEntityShowGauge').checked) {
+            entity.showGauge = true;
+            const minRaw = document.getElementById('newEntityGaugeMin').value;
+            const maxRaw = document.getElementById('newEntityGaugeMax').value;
+            if (minRaw !== '') entity.gaugeMin = parseFloat(minRaw);
+            if (maxRaw !== '') entity.gaugeMax = parseFloat(maxRaw);
+            const yellowRaw = document.getElementById('newEntityGaugeYellow').value;
+            const redRaw = document.getElementById('newEntityGaugeRed').value;
+            if (yellowRaw !== '') entity.gaugeYellow = parseFloat(yellowRaw);
+            if (redRaw !== '') entity.gaugeRed = parseFloat(redRaw);
+        }
     }
     if (domain === 'clock') {
         if (document.getElementById('newEntityHideClockDate').checked) entity.hideClockDate = true;
@@ -3329,15 +3827,8 @@ async function setClimateMode(entityId, mode) {
             hvac_mode: mode
         });
         
-        setTimeout(() => {
-            getStates().then(() => {
-                renderPages();
-                // Refresh modal if still open
-                if (currentClimateEntity === entityId) {
-                    openClimateModal(entityId);
-                }
-            });
-        }, 100);
+        // The new state re-renders the tile and refreshes the modal if it's still open
+        refreshStatesSoon(100);
     } catch (error) {
         console.error('Failed to set climate mode:', error);
         showError('Failed to set mode');
@@ -3606,7 +4097,7 @@ async function openWeatherForecast(entityId) {
     
     // Update forecast list
     const forecastList = document.getElementById('weatherForecastList');
-    forecastList.innerHTML = '<div style="text-align: center; padding: 20px; color: rgba(255, 255, 255, 0.5);">Loading forecast...</div>';
+    forecastList.innerHTML = '<div style="text-align: center; padding: 20px; color: rgba(var(--fg-rgb), 0.5);">Loading forecast...</div>';
     
     modal.classList.add('active');
 
@@ -3643,7 +4134,7 @@ async function openWeatherForecast(entityId) {
         
         if (forecastData.length === 0) {
             forecastList.innerHTML = `
-                <div style="text-align: center; padding: 20px; color: rgba(255, 255, 255, 0.5); font-size: 14px;">
+                <div style="text-align: center; padding: 20px; color: rgba(var(--fg-rgb), 0.5); font-size: 14px;">
                     No forecast data available.<br>
                     <small style="font-size: 12px; margin-top: 8px; display: block;">
                         Make sure your weather integration provides forecast data.
@@ -3691,7 +4182,7 @@ async function openWeatherForecast(entityId) {
     } catch (error) {
         console.error('Failed to fetch forecast:', error);
         forecastList.innerHTML = `
-            <div style="text-align: center; padding: 20px; color: rgba(255, 255, 255, 0.5); font-size: 14px;">
+            <div style="text-align: center; padding: 20px; color: rgba(var(--fg-rgb), 0.5); font-size: 14px;">
                 Failed to load forecast data.<br>
                 <small style="font-size: 12px; margin-top: 8px; display: block;">
                     ${error.message || 'Unknown error'}
@@ -3704,23 +4195,6 @@ async function openWeatherForecast(entityId) {
 function closeWeatherModal(event) {
     if (event && event.target !== event.currentTarget) return;
     document.getElementById('weatherModal').classList.remove('active');
-}
-
-// ============================================
-// POLLING
-// ============================================
-function startPolling() {
-    if (pollInterval) {
-        clearInterval(pollInterval);
-    }
-
-    pollInterval = setInterval(async () => {
-        await getStates();
-        // Don't re-render if user is dragging a slider
-        if (!isSliderDragging) {
-            renderPages();
-        }
-    }, 2000);
 }
 
 // ============================================
@@ -3750,6 +4224,7 @@ async function init() {
     }
     
     if (isScreensaverMode) {
+        isScreensaverOnlyMode = true;
         // Screensaver-only mode - works without room config
         document.querySelector('.container').style.display = 'none';
         
@@ -3770,19 +4245,14 @@ async function init() {
             entities: []
         };
         
-        await getStates();
+        // Temperature and weather stay live over the socket
+        await startLiveStates();
         
         // Show screensaver immediately and keep it visible
         document.getElementById('screensaver').classList.add('active');
         document.getElementById('screensaver').style.cursor = 'default';
         updateScreensaverClock();
         screensaverClockInterval = setInterval(updateScreensaverClock, 1000);
-        
-        // Update states periodically
-        setInterval(async () => {
-            await getStates();
-            updateScreensaverClock();
-        }, 30000); // Update every 30 seconds
         
         return;
     }
@@ -3804,6 +4274,7 @@ async function init() {
         const idx = roomConfigs.findIndex(r => r.roomName === roomParam);
         if (idx >= 0) config = { ...globalConfig, ...roomConfigs[idx] };
     }
+    applyTheme();
 
     // Restore admin view from URL params on reload
     if (adminView && (config || globalConfig.haToken)) {
@@ -3840,11 +4311,9 @@ async function init() {
         return;
     }
 
-    const states = await getStates();
-    if (states) {
-        renderPages();
-        startPolling();
-    } else {
+    const connected = await startLiveStates();
+    renderPages(); // if HA is down right now, the tiles go live once it answers
+    if (!connected) {
         showError('Cannot connect to Home Assistant');
         setTimeout(openAdmin, 2000);
     }
@@ -3925,7 +4394,7 @@ function renderIconGrid(icons) {
     grid.innerHTML = '';
     
     if (icons.length === 0) {
-        grid.innerHTML = '<div style="grid-column: 1 / -1; text-align: center; padding: 20px; color: rgba(255,255,255,0.5);">No icons found</div>';
+        grid.innerHTML = '<div style="grid-column: 1 / -1; text-align: center; padding: 20px; color: rgba(var(--fg-rgb), 0.5);">No icons found</div>';
         return;
     }
     
@@ -3980,23 +4449,58 @@ function testSound() {
 // ============================================
 // VOICE MESSAGES
 // ============================================
-let voiceMessages = [];
+// Messages carry their recorded audio as base64, so the full list can be big.
+// Polling only fetches a summary without the audio; the full list is loaded
+// to play, list or change messages, and reloaded right before every change
+// because saving writes the whole list back.
+let voiceMessages = [];          // full messages, as of the last loadVoiceMessages()
+let voiceMessageSummaries = [];  // what polling sees: same fields minus audioData
+const failedAutoplayKeys = new Set(); // auto-play failed once; don't re-download them every 5 s
 let isRecording = false;
 let mediaRecorder = null;
 let recordingChunks = [];
 let recordingTimer = null;
 let recordingSeconds = 0;
 
+// Returns false if it failed. Never save after a failed load: saving writes
+// the whole list, so it would drop every message that wasn't loaded.
 async function loadVoiceMessages() {
     try {
         const response = await fetch('/config-api.php?path=voice_messages');
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const data = await response.json();
         voiceMessages = data || [];
-        updatePhoneBadge();
+        syncVoiceMessageSummaries();
+        return true;
     } catch (error) {
         console.error('Failed to load voice messages:', error);
-        voiceMessages = [];
+        return false;
     }
+}
+
+// Cheap poll: the message list without audio. Returns false if it failed.
+async function loadVoiceMessageSummaries() {
+    try {
+        const response = await fetch('/config-api.php?path=voice_messages&summary=1');
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        // A server without the summary option sends the full list; drop the audio either way
+        voiceMessageSummaries = (data || []).map(({ audioData, ...message }) => message);
+        updatePhoneBadge();
+        return true;
+    } catch (error) {
+        console.error('Failed to check voice messages:', error);
+        return false;
+    }
+}
+
+function syncVoiceMessageSummaries() {
+    voiceMessageSummaries = voiceMessages.map(({ audioData, ...message }) => message);
+    updatePhoneBadge();
+}
+
+function voiceMessageKey(message) {
+    return `${message.timestamp}|${message.fromRoom}|${message.toRoom}`;
 }
 
 const FONT_OPTIONS = {
@@ -4024,6 +4528,13 @@ function applyFontFamily() {
     document.documentElement.style.setProperty('--font-body', font.stack);
 }
 
+// Room theme wins; empty means use the global default
+function applyTheme() {
+    const room = config && roomConfigs.find(r => r.roomName === config.roomName);
+    const theme = room?.theme || globalConfig.theme;
+    document.documentElement.dataset.theme = theme === 'light' ? 'light' : 'dark';
+}
+
 function applyDeviceModel() {
     document.querySelector('.container').classList.toggle('pro120', globalConfig.deviceModel === 'pro120');
 }
@@ -4048,7 +4559,7 @@ function applyHeaderVisibility() {
 
 function updatePhoneBadge() {
     const badge = document.getElementById('phoneBadge');
-    const unreadCount = voiceMessages.filter(m => m.toRoom === config.roomName && !m.read).length;
+    const unreadCount = voiceMessageSummaries.filter(m => m.toRoom === config.roomName && !m.read).length;
     
     if (unreadCount > 0) {
         badge.textContent = unreadCount;
@@ -4062,7 +4573,7 @@ async function openVoiceMessageModal() {
     const modal = document.getElementById('voiceMessageModal');
     const content = document.getElementById('voiceMessageContent');
     
-    await loadVoiceMessages();
+    const loaded = await loadVoiceMessages();
     
     // Filter messages for this room
     const myMessages = voiceMessages.filter(m => m.toRoom === config.roomName);
@@ -4084,7 +4595,7 @@ async function openVoiceMessageModal() {
                     </div>
                 `).join('')}
             </div>
-        ` : '<div style="text-align: center; padding: 20px; color: rgba(255,255,255,0.5); font-size: 13px;">No messages</div>'}
+        ` : '<div style="text-align: center; padding: 20px; color: rgba(var(--fg-rgb), 0.5); font-size: 13px;">No messages</div>'}
         
         <div class="voice-record-section">
             <div class="voice-room-buttons">
@@ -4108,9 +4619,9 @@ async function openVoiceMessageModal() {
     modal.classList.add('active');
     
     // Mark messages as read
+    if (!loaded) return;
     myMessages.forEach(msg => msg.read = true);
     await saveVoiceMessages();
-    updatePhoneBadge();
 }
 
 let selectedVoiceTarget = null;
@@ -4240,6 +4751,11 @@ async function sendVoiceMessage(audioBlob, toRoom) {
         
         reader.onloadend = async () => {
             const base64Audio = reader.result;
+            // Saving writes the whole list, so start from the latest
+            if (!await loadVoiceMessages()) {
+                showError('Failed to send voice message');
+                return;
+            }
             
             // Handle broadcast to all rooms
             if (toRoom === '__ALL__') {
@@ -4288,6 +4804,7 @@ async function saveVoiceMessages() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(voiceMessages)
         });
+        syncVoiceMessageSummaries();
     } catch (error) {
         console.error('Failed to save voice messages:', error);
     }
@@ -4314,8 +4831,14 @@ async function deleteVoiceMessage(index) {
     
     if (!message) return;
     
-    const globalIndex = voiceMessages.indexOf(message);
-    voiceMessages.splice(globalIndex, 1);
+    // Saving writes the whole list, so delete from the latest one
+    const key = voiceMessageKey(message);
+    if (!await loadVoiceMessages()) {
+        showError('Failed to delete message');
+        return;
+    }
+    const globalIndex = voiceMessages.findIndex(m => voiceMessageKey(m) === key);
+    if (globalIndex >= 0) voiceMessages.splice(globalIndex, 1);
     
     await saveVoiceMessages();
     openVoiceMessageModal(); // Refresh
@@ -4333,13 +4856,20 @@ function formatMessageTime(timestamp) {
     return date.toLocaleDateString();
 }
 
-// Check for new messages periodically
+// Check for new messages periodically. This keeps running while the page is
+// hidden (e.g. under Fully's screensaver) so incoming messages still play;
+// the summary poll is a few hundred bytes.
 setInterval(async () => {
-    if (config && config.roomName) {
-        await loadVoiceMessages();
+    if (config && config.roomName && !isScreensaverOnlyMode) {
+        if (!await loadVoiceMessageSummaries()) return;
+        const shouldAutoplay = m => m.toRoom === config.roomName && !m.read && !failedAutoplayKeys.has(voiceMessageKey(m));
+        if (!voiceMessageSummaries.some(shouldAutoplay)) return;
+
+        // Something to play: now fetch the audio
+        if (!await loadVoiceMessages()) return;
         
         // Auto-play unread messages
-        const unreadMessages = voiceMessages.filter(m => m.toRoom === config.roomName && !m.read);
+        const unreadMessages = voiceMessages.filter(shouldAutoplay);
         
         if (unreadMessages.length > 0) {
             // Play notification sound
@@ -4359,8 +4889,9 @@ setInterval(async () => {
                 // Mark as read
                 message.read = true;
                 await saveVoiceMessages();
-                updatePhoneBadge();
             } catch (error) {
+                // Stays unread (badge shows it); retrying would re-download the audio every 5 s
+                failedAutoplayKeys.add(voiceMessageKey(message));
                 console.error('Failed to auto-play message:', error);
             }
         }

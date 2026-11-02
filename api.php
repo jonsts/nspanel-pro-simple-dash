@@ -113,7 +113,14 @@ switch ($path) {
             file_put_contents($voiceMessagesFile, json_encode([]));
         }
         
-        if ($method === 'GET') {
+        if ($method === 'GET' && isset($_GET['summary'])) {
+            // The list without the recorded audio, for cheap polling
+            $messages = json_decode(file_get_contents($voiceMessagesFile), true) ?: [];
+            echo json_encode(array_map(function ($message) {
+                unset($message['audioData']);
+                return $message;
+            }, $messages));
+        } elseif ($method === 'GET') {
             echo file_get_contents($voiceMessagesFile);
         } elseif ($method === 'POST') {
             $data = json_decode(file_get_contents('php://input'), true);

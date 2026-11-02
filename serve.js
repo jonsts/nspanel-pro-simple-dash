@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-// Dev server replacing Docker: serves static files, handles config API, proxies /api/ to HA.
+// Dev server replacing Docker: serves static files, handles config API, proxies /api/ to HA
+// (including the /api/websocket upgrade the dashboard uses for live state).
 
 const http = require('http');
 const https = require('https');
@@ -106,7 +107,10 @@ async function handleConfigApi(req, res) {
   } else if (p === 'voice_messages') {
     const vmFile = dataFile('voice_messages.json');
     if (!fs.existsSync(vmFile)) fs.writeFileSync(vmFile, JSON.stringify([]));
-    if (method === 'GET') {
+    if (method === 'GET' && url.searchParams.has('summary')) {
+      // The list without the recorded audio, for cheap polling
+      res.end(JSON.stringify(readJson(vmFile, []).map(({ audioData, ...message }) => message)));
+    } else if (method === 'GET') {
       res.end(fs.readFileSync(vmFile, 'utf8'));
     } else if (method === 'POST') {
       const data = JSON.parse(await body(req));
@@ -152,6 +156,45 @@ function proxyToHA(req, res) {
   req.pipe(proxyReq);
 }
 
+// WebSocket upgrades (HA's /api/websocket): replay the handshake to HA, then pipe both sockets.
+function proxyUpgradeToHA(req, socket, head) {
+  const parsed = new URL(HA_URL + req.url);
+  const lib = parsed.protocol === 'https:' ? https : http;
+
+  const proxyReq = lib.request({
+    hostname: parsed.hostname, port: parsed.port, path: parsed.pathname + (parsed.search || ''),
+    method: req.method, headers: { ...req.headers, host: parsed.host },
+  });
+
+  proxyReq.on('upgrade', (proxyRes, proxySocket, proxyHead) => {
+    if (socket.destroyed) { proxySocket.destroy(); return; } // browser gave up during the handshake
+    let response = 'HTTP/1.1 101 Switching Protocols\r\n';
+    for (let i = 0; i < proxyRes.rawHeaders.length; i += 2) {
+      response += `${proxyRes.rawHeaders[i]}: ${proxyRes.rawHeaders[i + 1]}\r\n`;
+    }
+    socket.write(response + '\r\n');
+    if (proxyHead.length) socket.write(proxyHead);
+    if (head.length) proxySocket.write(head);
+    proxySocket.on('error', () => socket.destroy());
+    proxySocket.on('close', () => socket.destroy());
+    socket.on('close', () => proxySocket.destroy());
+    proxySocket.pipe(socket).pipe(proxySocket);
+  });
+
+  // HA answered with a normal response instead of switching protocols
+  proxyReq.on('response', (proxyRes) => {
+    socket.end(`HTTP/1.1 ${proxyRes.statusCode} ${proxyRes.statusMessage}\r\nConnection: close\r\n\r\n`);
+  });
+
+  proxyReq.on('error', (e) => {
+    console.error('HA WebSocket proxy error:', e.message);
+    socket.end('HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n');
+  });
+
+  socket.on('error', () => proxyReq.destroy());
+  proxyReq.end();
+}
+
 function serveStatic(req, res) {
   const urlPath = req.url.split('?')[0];
   const filePath = path.join(ROOT, urlPath === '/' ? 'index.html' : urlPath);
@@ -188,6 +231,11 @@ const server = http.createServer(async (req, res) => {
     res.statusCode = 500;
     res.end(JSON.stringify({ error: e.message }));
   }
+});
+
+server.on('upgrade', (req, socket, head) => {
+  if (req.url.split('?')[0].startsWith('/api/')) { proxyUpgradeToHA(req, socket, head); return; }
+  socket.destroy();
 });
 
 server.listen(PORT, () => {
