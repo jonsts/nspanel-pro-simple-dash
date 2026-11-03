@@ -201,9 +201,18 @@ actions:
       device: nspanel_abc123     # optional: only this panel (ID or list)
 ```
 
-Leave out `room` and `device` to open it on every panel. Send `close: true` (with the same targeting) to close the popup again. A panel's ID is shown under **Global Settings → Device**; it lives in that panel's browser storage, so it changes if the storage is cleared.
+Leave out `room` and `device` to open it on every panel. To close it again (e.g. when the ring is over), fire `nspanel_close_camera` with the same optional `room` / `device`; with an `entity_id` it only closes the popup if that camera is the one showing:
 
-The event needs the dashboard's token to belong to an admin user (Home Assistant only lets admins subscribe to custom events), and the panel only hears it while the page is visible. `?camera=` is the fallback for both: pointing the panel at the URL (e.g. with Fully Kiosk's `load_url`) reloads it and opens the popup.
+```yaml
+actions:
+  - event: nspanel_close_camera
+    event_data:
+      entity_id: doorbell        # optional
+```
+
+A panel's ID is shown under **Global Settings → Device**; it lives in that panel's browser storage, so it changes if the storage is cleared.
+
+The events need the dashboard's token to belong to an admin user (Home Assistant only lets admins subscribe to custom events), and the panel only hears it while the page is visible. `?camera=` is the fallback for both: pointing the panel at the URL (e.g. with Fully Kiosk's `load_url`) reloads it and opens the popup.
 
 ## Customization
 

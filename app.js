@@ -379,6 +379,7 @@ let haSocketLive = false;      // authenticated, subscribed and first snapshot a
 let haMsgId = 0;
 let haSubscriptionId = null;
 let haCameraEventSubId = null;
+let haCameraCloseSubId = null;
 let haRetryMs = 1000;
 let haRetryTimer = null;
 let haPingTimer = null;
@@ -516,6 +517,7 @@ function handleSocketMessage(msg) {
         case 'auth_ok':
             haSubscriptionId = sendSocketMessage({ type: 'subscribe_entities', entity_ids: watchedEntityIds });
             haCameraEventSubId = sendSocketMessage({ type: 'subscribe_events', event_type: CAMERA_EVENT_TYPE });
+            haCameraCloseSubId = sendSocketMessage({ type: 'subscribe_events', event_type: CAMERA_CLOSE_EVENT_TYPE });
             break;
         case 'auth_invalid':
             console.error('Home Assistant rejected the token:', msg.message);
@@ -525,9 +527,9 @@ function handleSocketMessage(msg) {
             if (msg.id === haSubscriptionId && !msg.success) {
                 console.error('subscribe_entities failed:', msg.error);
                 socketDown();
-            } else if (msg.id === haCameraEventSubId && !msg.success) {
+            } else if ((msg.id === haCameraEventSubId || msg.id === haCameraCloseSubId) && !msg.success) {
                 // Non-admin tokens can't subscribe to custom events; ?camera= still works.
-                console.warn(`Can't listen for ${CAMERA_EVENT_TYPE} (token needs an admin user):`, msg.error);
+                console.warn("Can't listen for camera events (token needs an admin user):", msg.error);
             }
             break;
         case 'pong':
@@ -536,6 +538,7 @@ function handleSocketMessage(msg) {
         case 'event':
             if (msg.id === haSubscriptionId) applyEntityEvent(msg.event);
             else if (msg.id === haCameraEventSubId) handleCameraEvent(msg.event.data || {});
+            else if (msg.id === haCameraCloseSubId) handleCameraCloseEvent(msg.event.data || {});
             break;
     }
 }
@@ -615,6 +618,7 @@ function closeSocket() {
     haSocketLive = false;
     haSubscriptionId = null;
     haCameraEventSubId = null;
+    haCameraCloseSubId = null;
     if (haSocket) {
         const ws = haSocket;
         haSocket = null;
@@ -4132,7 +4136,11 @@ let hlsJsPromise = null;
 
 // The camera doesn't have to be on the room's grid (e.g. opened from ?camera=);
 // without a tile it uses the default stream settings.
+// Only one camera shows at a time: opening another replaces the current
+// stream (startCameraStream stops it first). Re-opening the camera that's
+// already showing (e.g. the doorbell pressed twice) keeps the running stream.
 function openCameraModal(entityId) {
+    if (cameraSession && cameraSession.entityId === entityId && !cameraSession.failed) return;
     const entity = config.entities.find(e => e.id === entityId);
     const friendlyName = entityStates[entityId]?.attributes.friendly_name;
     document.getElementById('cameraModalTitle').textContent = entity?.label || friendlyName || 'Camera';
@@ -4166,28 +4174,36 @@ function normalizeCameraEntityId(id) {
     return id.startsWith('camera.') ? id : `camera.${id}`;
 }
 
-// An automation fires this event to pop a camera up on panels without a page
-// reload. Every panel hears it; optional `room` / `device` (a name or a list)
-// narrow it to the panels showing that room or with that panel ID.
-//   event: nspanel_open_camera
-//   event_data: { entity_id: doorbell, room: Hallway, device: nspanel_abc123 }
-// `close: true` closes the popup instead (e.g. when the ring is over).
+// Automations fire these events to open / close a camera popup on panels
+// without a page reload. Every panel hears them; optional `room` / `device`
+// (a name or a list) narrow them to the panels showing that room or with that
+// panel ID.
+//   event: nspanel_open_camera   event_data: { entity_id: doorbell, room: Hallway, device: nspanel_abc123 }
+//   event: nspanel_close_camera  event_data: { entity_id: doorbell, room: Hallway }  (all optional)
 const CAMERA_EVENT_TYPE = 'nspanel_open_camera';
+const CAMERA_CLOSE_EVENT_TYPE = 'nspanel_close_camera';
+
+function isCameraEventForThisPanel(data) {
+    const matches = (target, value) => target === undefined || [].concat(target).map(String).includes(value);
+    return matches(data.room, config.roomName) && matches(data.device, getDeviceId());
+}
 
 function handleCameraEvent(data) {
-    const matches = (target, value) => target === undefined || [].concat(target).map(String).includes(value);
-    if (!matches(data.room, config.roomName) || !matches(data.device, getDeviceId())) return;
-
-    if (data.close) {
-        closeCameraModal();
-        return;
-    }
+    if (!isCameraEventForThisPanel(data)) return;
     if (!data.entity_id) {
         console.warn(`${CAMERA_EVENT_TYPE} needs an entity_id`);
         return;
     }
     if (document.getElementById('screensaver').classList.contains('active')) exitScreensaver();
     openCameraModal(normalizeCameraEntityId(String(data.entity_id)));
+}
+
+// With an entity_id, only closes the popup if it's showing that camera, so one
+// camera's automation doesn't close another's.
+function handleCameraCloseEvent(data) {
+    if (!cameraSession || !isCameraEventForThisPanel(data)) return;
+    if (data.entity_id && normalizeCameraEntityId(String(data.entity_id)) !== cameraSession.entityId) return;
+    closeCameraModal();
 }
 
 function openHeaderCamera() {
@@ -4215,7 +4231,10 @@ async function startCameraStream(entityId, modes, showStats) {
         if (cameraSession !== session) return;
         console.error(`Camera ${mode} stream failed:`, message);
         if (fallbacks.length) startCameraStream(entityId, fallbacks, showStats);
-        else setCameraStatus('Camera stream unavailable');
+        else {
+            session.failed = true; // lets a re-open of this camera retry
+            setCameraStatus('Camera stream unavailable');
+        }
     };
     session.fail = fail;
     // Browsers don't reliably fire load for MJPEG, so a decoded size counts as a picture too.
