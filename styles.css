@@ -1797,6 +1797,18 @@ body {
     max-width: min(96%, 720px);
 }
 
+/* Portrait cameras: as tall as the screen allows, without getting wider than it */
+.camera-modal-content.portrait {
+    width: auto;
+    min-width: 280px;
+}
+
+.camera-modal-content.portrait .camera-view {
+    width: auto;
+    height: min(70vh, 640px, calc(96vw * var(--camera-ratio)));
+    margin: 0 auto;
+}
+
 /* Big, obvious close target: the stream is easy to leave running otherwise */
 .camera-modal-close {
     width: 56px;
@@ -1814,12 +1826,15 @@ body {
     background: rgba(var(--fg-rgb), 0.25);
 }
 
+.camera-modal-content .climate-modal-body {
+    padding: 0;
+}
+
 .camera-view {
     position: relative;
     width: 100%;
     aspect-ratio: 16 / 9;
     background: #000;
-    border-radius: 12px;
     overflow: hidden;
 }
 
@@ -1833,6 +1848,7 @@ body {
 .camera-status {
     min-height: 1.4em;
     margin: 10px 0;
+    padding: 0 16px;
     font-size: 12px;
     opacity: 0.6;
     text-align: center;

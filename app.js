@@ -258,6 +258,7 @@ async function saveConfig() {
             headerTempEntity: config.headerTempEntity,
             screensaverWeather: config.screensaverWeather,
             wakeEntity: config.wakeEntity,
+            headerCameraEntity: config.headerCameraEntity,
             gridColumns: config.gridColumns,
             gridRows: config.gridRows,
             theme: roomConfigs.find(r => r.roomName === config.roomName)?.theme || '',
@@ -377,6 +378,7 @@ let haSocket = null;
 let haSocketLive = false;      // authenticated, subscribed and first snapshot applied
 let haMsgId = 0;
 let haSubscriptionId = null;
+let haCameraEventSubId = null;
 let haRetryMs = 1000;
 let haRetryTimer = null;
 let haPingTimer = null;
@@ -513,6 +515,7 @@ function handleSocketMessage(msg) {
             break;
         case 'auth_ok':
             haSubscriptionId = sendSocketMessage({ type: 'subscribe_entities', entity_ids: watchedEntityIds });
+            haCameraEventSubId = sendSocketMessage({ type: 'subscribe_events', event_type: CAMERA_EVENT_TYPE });
             break;
         case 'auth_invalid':
             console.error('Home Assistant rejected the token:', msg.message);
@@ -522,6 +525,9 @@ function handleSocketMessage(msg) {
             if (msg.id === haSubscriptionId && !msg.success) {
                 console.error('subscribe_entities failed:', msg.error);
                 socketDown();
+            } else if (msg.id === haCameraEventSubId && !msg.success) {
+                // Non-admin tokens can't subscribe to custom events; ?camera= still works.
+                console.warn(`Can't listen for ${CAMERA_EVENT_TYPE} (token needs an admin user):`, msg.error);
             }
             break;
         case 'pong':
@@ -529,6 +535,7 @@ function handleSocketMessage(msg) {
             break;
         case 'event':
             if (msg.id === haSubscriptionId) applyEntityEvent(msg.event);
+            else if (msg.id === haCameraEventSubId) handleCameraEvent(msg.event.data || {});
             break;
     }
 }
@@ -607,6 +614,7 @@ function closeSocket() {
     clearTimeout(haPongTimer);
     haSocketLive = false;
     haSubscriptionId = null;
+    haCameraEventSubId = null;
     if (haSocket) {
         const ws = haSocket;
         haSocket = null;
@@ -825,6 +833,7 @@ function renderPages() {
 
     document.getElementById('roomName').textContent = config.roomName;
     updateHeaderTemp();
+    document.getElementById('headerCameraBtn').style.display = config.headerCameraEntity ? 'flex' : 'none';
     updateNowPlayingIndicator(mediaPlayers);
     updatePagePosition();
     scheduleClockTiles();
@@ -2827,6 +2836,11 @@ function showGlobalSettings() {
         <div class="settings-section">
             <div class="settings-section-title">Device</div>
             <div class="form-group">
+                <label class="form-label">This Panel's ID</label>
+                <input type="text" class="form-input" value="${getDeviceId()}" readonly onclick="this.select()">
+                <small style="color: #888; font-size: 12px;">Use as <code>device</code> in an nspanel_open_camera event to target only this panel. Stored in this panel's browser, so it changes if its storage is cleared.</small>
+            </div>
+            <div class="form-group">
                 <label class="form-label">Model</label>
                 <select class="form-input" id="deviceModelInput">
                     <option value="pro" ${(globalConfig.deviceModel || 'pro') === 'pro' ? 'selected' : ''}>NSPanel Pro (480×480)</option>
@@ -2923,6 +2937,7 @@ function getRoomEditorCurrentState() {
         headerTempEntity: document.getElementById('headerTempEntityInput')?.value.trim() || '',
         screensaverWeather: document.getElementById('screensaverWeatherInput')?.value.trim() || '',
         wakeEntity: document.getElementById('wakeEntityInput')?.value.trim() || '',
+        headerCameraEntity: document.getElementById('headerCameraEntityInput')?.value.trim() || '',
         gridColumns: parseInt(document.getElementById('gridColumnsInput')?.value) || 2,
         gridRows: parseInt(document.getElementById('gridRowsInput')?.value) || 2,
         theme: document.getElementById('roomThemeInput')?.value || '',
@@ -3018,6 +3033,12 @@ function showRoomEditor(mode, roomIdx) {
             <label class="form-label">Wake Entity (Optional)</label>
             <input type="text" class="form-input" id="wakeEntityInput" placeholder="binary_sensor.bathroom_motion" value="${(roomData.wakeEntity || '').replace(/[&"<>]/g, c => `&#${c.charCodeAt(0)};`)}">
             <small style="color: #888; font-size: 12px;">Hides the screensaver while this entity is "on" (e.g. a motion sensor)</small>
+        </div>
+
+        <div class="form-group">
+            <label class="form-label">Header Camera (Optional)</label>
+            <input type="text" class="form-input" id="headerCameraEntityInput" placeholder="doorbell or camera.doorbell" value="${(roomData.headerCameraEntity || '').replace(/[&"<>]/g, c => `&#${c.charCodeAt(0)};`)}">
+            <small style="color: #888; font-size: 12px;">Adds a camera button to the header that opens this camera's popup. Use a fluent stream from HA for best performance</small>
         </div>
 
         <div class="form-group">
@@ -3145,6 +3166,7 @@ function showRoomEditor(mode, roomIdx) {
         headerTempEntity: roomData.headerTempEntity || '',
         screensaverWeather: roomData.screensaverWeather || '',
         wakeEntity: roomData.wakeEntity || '',
+        headerCameraEntity: roomData.headerCameraEntity || '',
         gridColumns: roomData.gridColumns || 2,
         gridRows: roomData.gridRows || 2,
         theme: roomData.theme || '',
@@ -3245,6 +3267,7 @@ async function saveRoom(mode) {
     const headerTempEntity = document.getElementById('headerTempEntityInput').value.trim();
     const screensaverWeather = document.getElementById('screensaverWeatherInput').value.trim();
     const wakeEntity = document.getElementById('wakeEntityInput').value.trim();
+    const headerCameraEntity = normalizeCameraEntityId(document.getElementById('headerCameraEntityInput').value.trim());
     const gridColumns = parseInt(document.getElementById('gridColumnsInput').value) || 2;
     const gridRows = parseInt(document.getElementById('gridRowsInput').value) || 2;
     const theme = document.getElementById('roomThemeInput').value;
@@ -3259,6 +3282,11 @@ async function saveRoom(mode) {
         return;
     }
 
+    if (headerCameraEntity && !VALID_ENTITY_ID.test(headerCameraEntity)) {
+        showError('Header camera must be a camera entity, e.g. camera.doorbell');
+        return;
+    }
+
     if (!window.editingRoomData || !window.editingRoomData.entities || window.editingRoomData.entities.length === 0) {
         showError('Please add at least one entity');
         return;
@@ -3269,6 +3297,7 @@ async function saveRoom(mode) {
         headerTempEntity,
         screensaverWeather,
         wakeEntity,
+        headerCameraEntity,
         gridColumns,
         gridRows,
         theme,
@@ -4108,6 +4137,7 @@ function openCameraModal(entityId) {
     const friendlyName = entityStates[entityId]?.attributes.friendly_name;
     document.getElementById('cameraModalTitle').textContent = entity?.label || friendlyName || 'Camera';
     document.getElementById('cameraModal').classList.add('active');
+    applyCameraShape(16, 9); // until the first frame says otherwise
 
     const streamType = entity?.streamType || 'auto';
     const modes = streamType === 'auto' ? CAMERA_STREAM_ORDER : [streamType];
@@ -4118,6 +4148,50 @@ function closeCameraModal(event) {
     if (event && event.target !== event.currentTarget) return;
     stopCameraStream();
     document.getElementById('cameraModal').classList.remove('active');
+}
+
+// Sizes the video area to the camera's own shape. Portrait cameras (most
+// doorbells) are sized by the available height instead of the width.
+function applyCameraShape(width, height) {
+    const view = document.querySelector('.camera-view');
+    view.style.aspectRatio = `${width} / ${height}`;
+    view.style.setProperty('--camera-ratio', height / width);
+    document.querySelector('.camera-modal-content').classList.toggle('portrait', height > width);
+}
+
+// Camera ids may be given without their domain ("doorbell_fluent"): only
+// camera entities can stream, so the prefix is implied.
+function normalizeCameraEntityId(id) {
+    if (!id) return '';
+    return id.startsWith('camera.') ? id : `camera.${id}`;
+}
+
+// An automation fires this event to pop a camera up on panels without a page
+// reload. Every panel hears it; optional `room` / `device` (a name or a list)
+// narrow it to the panels showing that room or with that panel ID.
+//   event: nspanel_open_camera
+//   event_data: { entity_id: doorbell, room: Hallway, device: nspanel_abc123 }
+// `close: true` closes the popup instead (e.g. when the ring is over).
+const CAMERA_EVENT_TYPE = 'nspanel_open_camera';
+
+function handleCameraEvent(data) {
+    const matches = (target, value) => target === undefined || [].concat(target).map(String).includes(value);
+    if (!matches(data.room, config.roomName) || !matches(data.device, getDeviceId())) return;
+
+    if (data.close) {
+        closeCameraModal();
+        return;
+    }
+    if (!data.entity_id) {
+        console.warn(`${CAMERA_EVENT_TYPE} needs an entity_id`);
+        return;
+    }
+    if (document.getElementById('screensaver').classList.contains('active')) exitScreensaver();
+    openCameraModal(normalizeCameraEntityId(String(data.entity_id)));
+}
+
+function openHeaderCamera() {
+    if (config.headerCameraEntity) openCameraModal(config.headerCameraEntity);
 }
 
 function setCameraStatus(text) {
@@ -4134,6 +4208,7 @@ async function startCameraStream(entityId, modes, showStats) {
     const video = document.getElementById('cameraVideo');
     const img = document.getElementById('cameraImage');
     video.style.display = mode === 'mjpeg' ? 'none' : 'block';
+    video.onresize = () => { if (video.videoWidth) applyCameraShape(video.videoWidth, video.videoHeight); };
     img.style.display = mode === 'mjpeg' ? 'block' : 'none';
 
     const fail = (message) => {
@@ -4347,8 +4422,9 @@ function watchFirstFrame(session, video) {
 async function updateCameraStats(session) {
     if (cameraSession !== session) return;
     const img = document.getElementById('cameraImage');
-    if (session.mode === 'mjpeg' && img.naturalWidth && !session.firstFrameMs) {
-        session.firstFrameMs = performance.now() - session.startedAt;
+    if (session.mode === 'mjpeg' && img.naturalWidth) {
+        if (!session.firstFrameMs) session.firstFrameMs = performance.now() - session.startedAt;
+        applyCameraShape(img.naturalWidth, img.naturalHeight);
     }
     if (!session.showStats) {
         setCameraStatus(session.firstFrameMs ? '' : 'Connecting…');
@@ -4690,15 +4766,15 @@ async function init() {
         return;
     }
 
-    // ?camera=camera.front_door opens that camera's popup, so an automation can
-    // pop it up by pointing the panel at a URL. Dropped from the URL afterwards
-    // so a reload doesn't reopen it.
+    // ?camera=front_door (or camera.front_door) opens that camera's popup, so an
+    // automation can pop it up by pointing the panel at a URL. Dropped from the
+    // URL afterwards so a reload doesn't reopen it.
     const cameraParam = urlParams.get('camera');
-    if (cameraParam && cameraParam.startsWith('camera.')) {
+    if (cameraParam) {
         const params = new URLSearchParams(window.location.search);
         params.delete('camera');
         history.replaceState(null, '', '?' + params.toString());
-        openCameraModal(cameraParam);
+        openCameraModal(normalizeCameraEntityId(cameraParam));
     }
 }
 
