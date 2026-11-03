@@ -173,6 +173,7 @@ Tap the phone icon in the header to record a short (max 30s) audio message and s
 | `?mode=new\|edit&room=RoomName` | Open the room editor in a specific mode |
 | `?debug=true` | Show persistent edit/settings buttons instead of relying on long-press |
 | `?screensaver=true` | Standalone screensaver mode |
+| `?camera=camera.entity_id` | Open that camera's stream popup on load (e.g. from a doorbell automation); works with `room=` and for cameras that aren't on the grid |
 
 ## Customization
 

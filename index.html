@@ -93,6 +93,22 @@
     </div>
 
     <!-- Alarm Control Modal -->
+    <div class="climate-modal" id="cameraModal" onclick="closeCameraModal(event)">
+        <div class="climate-modal-content camera-modal-content" onclick="event.stopPropagation()">
+            <div class="climate-modal-header">
+                <div class="climate-modal-title" id="cameraModalTitle">Camera</div>
+                <button class="climate-modal-close camera-modal-close" onclick="closeCameraModal()" aria-label="Close camera">close</button>
+            </div>
+            <div class="climate-modal-body">
+                <div class="camera-view">
+                    <video id="cameraVideo" autoplay muted playsinline></video>
+                    <img id="cameraImage" alt="" style="display: none;">
+                </div>
+                <div class="camera-status" id="cameraStatus"></div>
+            </div>
+        </div>
+    </div>
+
     <div class="climate-modal" id="alarmModal" onclick="closeAlarmModal(event)">
         <div class="climate-modal-content" onclick="event.stopPropagation()">
             <div class="climate-modal-header">
@@ -213,6 +229,7 @@
                                 <option value="cover">cover</option>
                                 <option value="lock">lock</option>
                                 <option value="alarm_control_panel">alarm_control_panel</option>
+                                <option value="camera">camera</option>
                                 <option value="fan">fan</option>
                                 <option value="group">group</option>
                                 <option value="input_boolean">input_boolean</option>
@@ -279,6 +296,23 @@
                             <input type="number" id="newEntityGaugeRed" class="form-input" placeholder="Red from" aria-label="Gauge red threshold" style="width: 100px; padding: 6px 8px;">
                         </div>
                         <small style="color: #888; font-size: 12px;">Below yellow = green. Leave both empty for a blue → red gradient.</small>
+                    </div>
+                    <div id="entityOptCamera" style="display: none; flex-direction: column; gap: 8px;">
+                        <label class="form-label" for="newEntityStreamType">Stream type</label>
+                        <select id="newEntityStreamType" class="form-input" style="padding: 6px 8px;">
+                            <option value="auto">Auto (WebRTC → HLS → MJPEG)</option>
+                            <option value="webrtc">WebRTC</option>
+                            <option value="hls">HLS</option>
+                            <option value="mjpeg">MJPEG</option>
+                        </select>
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="newEntityShowStreamStats" aria-label="Show stream stats" style="width: 18px; height: 18px; cursor: pointer;">
+                            <span style="font-size: 13px; color: #888;">Show stream stats (fps, latency, decoder)</span>
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="newEntityHideTile" aria-label="Hide tile" style="width: 18px; height: 18px; cursor: pointer;">
+                            <span style="font-size: 13px; color: #888;">Hide tile (popup only, opened by URL or automation)</span>
+                        </label>
                     </div>
                     <div id="entityOptWeather" style="display: none; flex-direction: column; gap: 8px;">
                         <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">

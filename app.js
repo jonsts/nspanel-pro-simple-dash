@@ -641,8 +641,12 @@ function resumeLiveStates() {
 }
 
 document.addEventListener('visibilitychange', () => {
-    if (document.hidden) pauseLiveStates();
-    else resumeLiveStates();
+    if (document.hidden) {
+        pauseLiveStates();
+        closeCameraModal(); // don't keep pulling video with the screen off
+    } else {
+        resumeLiveStates();
+    }
 });
 
 // A cancelled touch never reaches the slider's touchend, so release the render hold here.
@@ -738,7 +742,7 @@ function renderPages() {
     pagesRendered = true;
 
     // Filter out media players from regular entities
-    const regularEntities = config.entities.filter(e => !e.id.startsWith('media_player.'));
+    const regularEntities = config.entities.filter(isGridEntity);
     const mediaPlayers = config.entities.filter(e => e.id.startsWith('media_player.'));
     
     // Add assistant command tiles to regular entities
@@ -1250,8 +1254,14 @@ function updateNowPlayingIndicator(mediaPlayers) {
     }
 }
 
+// Entities that get a tile on the grid pages: media players have their own page,
+// and hidden cameras exist only for their popup settings (?camera=).
+function isGridEntity(entity) {
+    return !entity.id.startsWith('media_player.') && !entity.hideTile;
+}
+
 function goToMediaPage() {
-    const regularEntities = config.entities.filter(e => !e.id.startsWith('media_player.'));
+    const regularEntities = config.entities.filter(isGridEntity);
     const assistantCommandTiles = (config.assistantCommands || []).map(cmd => ({
         id: `assistant_command.${cmd.label.toLowerCase().replace(/\s+/g, '_')}`,
         label: cmd.label,
@@ -1372,6 +1382,8 @@ function createTile(entity, state) {
         return createCoverTile(entity, state);
     } else if (domain === 'alarm_control_panel') {
         return createAlarmTile(entity, state);
+    } else if (domain === 'camera') {
+        return createCameraTile(entity, state);
     }
 
     const stateValue = state ? state.state : null;
@@ -1899,7 +1911,8 @@ function getEntityIcon(domain, entityId) {
         'input_boolean': 'toggle_on',
         'automation': 'settings_suggest',
         'weather': 'partly_cloudy_day',
-        'alarm_control_panel': 'security'
+        'alarm_control_panel': 'security',
+        'camera': 'videocam'
     };
 
     return iconMap[domain] || 'toggle_on';
@@ -2085,6 +2098,46 @@ function createAlarmTile(entity, state) {
 
     if (!isUnavailable && !entity.disableAction) {
         tile.onclick = () => openAlarmModal(entity.id);
+    }
+
+    return tile;
+}
+
+function createCameraTile(entity, state) {
+    const tile = document.createElement('div');
+    tile.className = 'tile camera';
+
+    const isUnavailable = !state || state.state === 'unavailable';
+    if (isUnavailable) {
+        tile.classList.add('unavailable');
+    } else if (entity.disableAction) {
+        tile.classList.add('no-action');
+    }
+
+    const icon = document.createElement('div');
+    icon.className = 'tile-icon';
+    icon.textContent = entity.icon || getEntityIcon('camera', entity.id);
+
+    const content = document.createElement('div');
+    content.className = 'tile-content';
+
+    const label = document.createElement('div');
+    label.className = 'tile-label';
+    label.textContent = entity.label;
+    content.appendChild(label);
+
+    if (!entity.hideState) {
+        const stateText = document.createElement('div');
+        stateText.className = 'tile-state';
+        stateText.textContent = isUnavailable ? 'UNAVAILABLE' : 'LIVE';
+        content.appendChild(stateText);
+    }
+
+    tile.appendChild(icon);
+    tile.appendChild(content);
+
+    if (!isUnavailable && !entity.disableAction) {
+        tile.onclick = () => openCameraModal(entity.id);
     }
 
     return tile;
@@ -2390,7 +2443,7 @@ function showError(message) {
 // PAGE NAVIGATION
 // ============================================
 function goToPage(pageIndex) {
-    const regularEntities = config.entities.filter(e => !e.id.startsWith('media_player.'));
+    const regularEntities = config.entities.filter(isGridEntity);
     const mediaPlayers = config.entities.filter(e => e.id.startsWith('media_player.'));
     const assistantCommandTiles = (config.assistantCommands || []).map(cmd => ({
         id: `assistant_command.${cmd.label.toLowerCase().replace(/\s+/g, '_')}`,
@@ -2428,7 +2481,7 @@ function updateDots() {
 }
 
 function nextPage() {
-    const regularEntities = config.entities.filter(e => !e.id.startsWith('media_player.'));
+    const regularEntities = config.entities.filter(isGridEntity);
     const mediaPlayers = config.entities.filter(e => e.id.startsWith('media_player.'));
     const assistantCommandTiles = (config.assistantCommands || []).map(cmd => ({
         id: `assistant_command.${cmd.label.toLowerCase().replace(/\s+/g, '_')}`,
@@ -2512,8 +2565,8 @@ function isWakeEntityOn() {
 }
 
 function enterScreensaver() {
-    // Stay awake while the room's motion sensor still reports presence
-    if (isWakeEntityOn()) {
+    // Stay awake while the room's motion sensor still reports presence, or a camera is open
+    if (isWakeEntityOn() || cameraSession) {
         resetInactivityTimer();
         return;
     }
@@ -3314,6 +3367,7 @@ function updateEntityFormForDomain() {
     document.getElementById('entityOptLight').style.display = domain === 'light' ? 'block' : 'none';
     document.getElementById('entityOptSensor').style.display = domain === 'sensor' ? 'flex' : 'none';
     document.getElementById('entityOptWeather').style.display = domain === 'weather' ? 'flex' : 'none';
+    document.getElementById('entityOptCamera').style.display = domain === 'camera' ? 'flex' : 'none';
     document.getElementById('entityOptClock').style.display = isClock ? 'flex' : 'none';
 
     // Inline forecast needs vertical room, so it's unavailable on half-height tiles
@@ -3364,6 +3418,9 @@ function openEntityModal(index) {
         document.getElementById('newEntityTileHeight').value = entity.tileHeight || 'normal';
         document.getElementById('newEntityHideClockDate').checked = entity.hideClockDate || false;
         document.getElementById('newEntityClockFormat').value = entity.clockTimeFormat || '';
+        document.getElementById('newEntityStreamType').value = entity.streamType || 'auto';
+        document.getElementById('newEntityShowStreamStats').checked = entity.showStreamStats || false;
+        document.getElementById('newEntityHideTile').checked = entity.hideTile || false;
     } else {
         document.getElementById('newEntityDomain').value = 'light';
         document.getElementById('newEntityId').value = '';
@@ -3389,6 +3446,9 @@ function openEntityModal(index) {
         document.getElementById('newEntityTileHeight').value = 'normal';
         document.getElementById('newEntityHideClockDate').checked = false;
         document.getElementById('newEntityClockFormat').value = '';
+        document.getElementById('newEntityStreamType').value = 'auto';
+        document.getElementById('newEntityShowStreamStats').checked = false;
+        document.getElementById('newEntityHideTile').checked = false;
     }
 
     // Populate width options based on current room column count
@@ -3461,6 +3521,12 @@ function saveEntityModal() {
         const clockFormat = document.getElementById('newEntityClockFormat').value;
         if (clockFormat) entity.clockTimeFormat = clockFormat;
     }
+    if (domain === 'camera') {
+        const streamType = document.getElementById('newEntityStreamType').value;
+        if (streamType && streamType !== 'auto') entity.streamType = streamType;
+        if (document.getElementById('newEntityShowStreamStats').checked) entity.showStreamStats = true;
+        if (document.getElementById('newEntityHideTile').checked) entity.hideTile = true;
+    }
     if (domain === 'weather') {
         if (document.getElementById('newEntityHideWeatherName').checked) entity.hideWeatherName = true;
         if (document.getElementById('newEntityHideWeatherIcon').checked) entity.hideWeatherIcon = true;
@@ -3508,6 +3574,7 @@ function refreshEntityList() {
 
         const iconText = entity.icon ? `<span style="font-family: 'Material Symbols Outlined'; font-size: 14px; color: #42a5f5; margin-right: 4px;">${entity.icon}</span>` : '';
         const hideStateText = entity.hideState ? '<span style="font-size: 10px; color: #888; margin-left: 8px;">[Hidden]</span>' : '';
+        const hideTileText = entity.hideTile ? '<span style="font-size: 10px; color: #888; margin-left: 8px;">[No tile]</span>' : '';
         const displayLabel = entity.label || (entity.id.startsWith('clock.') ? 'Clock' : entity.id);
 
         item.innerHTML = `
@@ -3517,7 +3584,7 @@ function refreshEntityList() {
                     <button class="reorder-btn" onclick="moveEntityDown(${idx})" ${idx === window.editingRoomData.entities.length - 1 ? 'disabled' : ''}>arrow_downward</button>
                 </div>
                 <div>
-                    <div>${iconText}<strong>${displayLabel}</strong>${hideStateText}</div>
+                    <div>${iconText}<strong>${displayLabel}</strong>${hideStateText}${hideTileText}</div>
                     <small style="color: #888;">${entity.id}</small>
                 </div>
             </div>
@@ -4022,6 +4089,310 @@ async function setAlarmMode(entityId, service, code) {
 }
 
 // ============================================
+// CAMERA STREAM MODAL
+// ============================================
+// The stream type is set per camera in the entity editor. 'auto' tries WebRTC
+// (HA's built-in go2rtc: lowest latency, hardware decode), then HLS, then
+// MJPEG, moving on when one fails or shows no picture in time.
+const CAMERA_STREAM_ORDER = ['webrtc', 'hls', 'mjpeg'];
+const CAMERA_FIRST_FRAME_TIMEOUT_MS = 10000;
+const HLS_JS_URL = 'https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js';
+
+let cameraSession = null; // { entityId, mode, showStats, startedAt, socket, pc, hls, statsTimer, frameTimer, lastFrames, lastStatsAt }
+let hlsJsPromise = null;
+
+// The camera doesn't have to be on the room's grid (e.g. opened from ?camera=);
+// without a tile it uses the default stream settings.
+function openCameraModal(entityId) {
+    const entity = config.entities.find(e => e.id === entityId);
+    const friendlyName = entityStates[entityId]?.attributes.friendly_name;
+    document.getElementById('cameraModalTitle').textContent = entity?.label || friendlyName || 'Camera';
+    document.getElementById('cameraModal').classList.add('active');
+
+    const streamType = entity?.streamType || 'auto';
+    const modes = streamType === 'auto' ? CAMERA_STREAM_ORDER : [streamType];
+    startCameraStream(entityId, modes, !!entity?.showStreamStats);
+}
+
+function closeCameraModal(event) {
+    if (event && event.target !== event.currentTarget) return;
+    stopCameraStream();
+    document.getElementById('cameraModal').classList.remove('active');
+}
+
+function setCameraStatus(text) {
+    document.getElementById('cameraStatus').textContent = text;
+}
+
+async function startCameraStream(entityId, modes, showStats) {
+    stopCameraStream();
+    const [mode, ...fallbacks] = modes;
+    const session = { entityId, mode, showStats, startedAt: performance.now(), lastFrames: 0, lastStatsAt: 0 };
+    cameraSession = session;
+    setCameraStatus('Connecting…');
+
+    const video = document.getElementById('cameraVideo');
+    const img = document.getElementById('cameraImage');
+    video.style.display = mode === 'mjpeg' ? 'none' : 'block';
+    img.style.display = mode === 'mjpeg' ? 'block' : 'none';
+
+    const fail = (message) => {
+        if (cameraSession !== session) return;
+        console.error(`Camera ${mode} stream failed:`, message);
+        if (fallbacks.length) startCameraStream(entityId, fallbacks, showStats);
+        else setCameraStatus('Camera stream unavailable');
+    };
+    session.fail = fail;
+    // Browsers don't reliably fire load for MJPEG, so a decoded size counts as a picture too.
+    session.frameTimer = setTimeout(() => {
+        if (!session.firstFrameMs && !(mode === 'mjpeg' && img.naturalWidth)) fail('no picture in time');
+    }, CAMERA_FIRST_FRAME_TIMEOUT_MS);
+
+    try {
+        if (mode === 'mjpeg') {
+            await startMjpegStream(session, img);
+        } else {
+            session.socket = await openCameraSocket();
+            if (cameraSession !== session) { session.socket.close(); return; }
+            if (mode === 'hls') await startHlsStream(session, video);
+            else await startWebRtcStream(session, video);
+        }
+    } catch (error) {
+        fail(error.message);
+        return;
+    }
+    if (cameraSession === session) session.statsTimer = setInterval(() => updateCameraStats(session), 1000);
+}
+
+function stopCameraStream() {
+    const session = cameraSession;
+    cameraSession = null;
+    if (!session) return;
+
+    clearInterval(session.statsTimer);
+    clearTimeout(session.frameTimer);
+    if (session.hls) session.hls.destroy();
+    if (session.pc) session.pc.close();
+    if (session.socket) session.socket.close();
+
+    const video = document.getElementById('cameraVideo');
+    video.pause();
+    video.srcObject = null;
+    video.removeAttribute('src');
+    video.load();
+    // Clearing src is what makes the browser drop an MJPEG connection.
+    document.getElementById('cameraImage').removeAttribute('src');
+}
+
+// A short-lived socket just for stream negotiation, kept apart from the state
+// subscription so closing the popup tears everything down in one go.
+function openCameraSocket() {
+    return new Promise((resolve, reject) => {
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${protocol}//${location.host}/api/websocket`);
+        const handlers = {};
+        let nextId = 0;
+
+        const socket = {
+            close() { ws.onclose = null; try { ws.close(); } catch (e) { /* already closed */ } },
+            // onMessage receives every message for this id (result and events).
+            send(msg, onMessage) {
+                msg.id = ++nextId;
+                if (onMessage) handlers[msg.id] = onMessage;
+                ws.send(JSON.stringify(msg));
+                return msg.id;
+            },
+            request(msg) {
+                return new Promise((res, rej) => socket.send(msg, reply => {
+                    if (reply.type !== 'result') return;
+                    if (reply.success) res(reply.result);
+                    else rej(new Error(reply.error?.message || 'request failed'));
+                }));
+            }
+        };
+
+        ws.onmessage = (event) => {
+            let msg;
+            try { msg = JSON.parse(event.data); } catch (e) { return; }
+            if (msg.type === 'auth_required') ws.send(JSON.stringify({ type: 'auth', access_token: globalConfig.haToken }));
+            else if (msg.type === 'auth_ok') resolve(socket);
+            else if (msg.type === 'auth_invalid') reject(new Error('token rejected'));
+            else if (handlers[msg.id]) handlers[msg.id](msg);
+        };
+        ws.onerror = () => reject(new Error('socket error'));
+        ws.onclose = () => {
+            reject(new Error('socket closed'));
+            if (cameraSession && cameraSession.socket === socket) cameraSession.fail('socket closed');
+        };
+    });
+}
+
+async function startMjpegStream(session, img) {
+    // Cameras that aren't on the grid aren't in the live states, so ask for the token.
+    const state = entityStates[session.entityId] || await fetchEntityState(session.entityId);
+    if (cameraSession !== session) return;
+    const token = state?.attributes.access_token;
+    if (!token) throw new Error('no camera access token');
+    img.onload = () => { if (cameraSession === session) session.firstFrameMs = performance.now() - session.startedAt; };
+    img.onerror = () => session.fail('image failed to load');
+    img.src = `/api/camera_proxy_stream/${session.entityId}?token=${encodeURIComponent(token)}`;
+}
+
+async function startHlsStream(session, video) {
+    const { url } = await session.socket.request({ type: 'camera/stream', entity_id: session.entityId, format: 'hls' });
+    if (cameraSession !== session) return;
+    watchFirstFrame(session, video);
+
+    // Prefer hls.js (MSE) over the WebView's native HLS: it plays closer to the live edge.
+    const Hls = await loadHlsJs().catch(() => null);
+    if (cameraSession !== session) return;
+    if (Hls && Hls.isSupported()) {
+        session.hls = new Hls({ lowLatencyMode: true, liveSyncDurationCount: 1, backBufferLength: 0 });
+        session.hls.loadSource(url);
+        session.hls.attachMedia(video);
+        session.hls.on(Hls.Events.ERROR, (_, data) => {
+            if (data.fatal) session.fail(data.details);
+        });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = url;
+    } else {
+        throw new Error('this browser cannot play HLS');
+    }
+    video.play().catch(() => {});
+}
+
+function loadHlsJs() {
+    if (window.Hls) return Promise.resolve(window.Hls);
+    if (!hlsJsPromise) {
+        hlsJsPromise = new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = HLS_JS_URL;
+            script.onload = () => resolve(window.Hls);
+            script.onerror = () => { hlsJsPromise = null; reject(new Error('could not load hls.js')); };
+            document.head.appendChild(script);
+        });
+    }
+    return hlsJsPromise;
+}
+
+// Home Assistant 2024.11+ WebRTC signalling: the offer subscription streams back
+// session/answer/candidate events, and our ICE candidates go up as separate messages.
+async function startWebRtcStream(session, video) {
+    const { entityId, socket } = session;
+    const clientConfig = await socket.request({ type: 'camera/webrtc/get_client_config', entity_id: entityId });
+    if (cameraSession !== session) return;
+
+    const pc = new RTCPeerConnection(clientConfig.configuration);
+    session.pc = pc;
+    if (clientConfig.dataChannel) pc.createDataChannel(clientConfig.dataChannel);
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+    pc.ontrack = (event) => {
+        if (!video.srcObject) video.srcObject = event.streams[0] || new MediaStream();
+        if (!event.streams[0]) video.srcObject.addTrack(event.track);
+        video.play().catch(() => {});
+    };
+    pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'failed') session.fail('connection failed');
+    };
+    watchFirstFrame(session, video);
+
+    let sessionId = null;
+    const pendingCandidates = [];
+    const sendCandidate = (candidate) => socket.send({
+        type: 'camera/webrtc/candidate', entity_id: entityId, session_id: sessionId, candidate
+    });
+    pc.onicecandidate = (event) => {
+        if (!event.candidate) return;
+        const candidate = event.candidate.toJSON();
+        if (sessionId) sendCandidate(candidate);
+        else pendingCandidates.push(candidate);
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    if (cameraSession !== session) return;
+
+    await new Promise((resolve, reject) => {
+        socket.send({ type: 'camera/webrtc/offer', entity_id: entityId, offer: offer.sdp }, async (msg) => {
+            if (msg.type === 'result') {
+                if (!msg.success) reject(new Error(msg.error?.message || 'offer rejected'));
+                return;
+            }
+            const event = msg.event;
+            if (event.type === 'session') {
+                sessionId = event.session_id;
+                pendingCandidates.splice(0).forEach(sendCandidate);
+            } else if (event.type === 'answer') {
+                await pc.setRemoteDescription({ type: 'answer', sdp: event.answer });
+                resolve();
+            } else if (event.type === 'candidate') {
+                pc.addIceCandidate(event.candidate).catch(() => {});
+            } else if (event.type === 'error') {
+                reject(new Error(event.message || event.code));
+            }
+        });
+    });
+}
+
+function watchFirstFrame(session, video) {
+    video.onloadeddata = () => {
+        if (cameraSession === session && !session.firstFrameMs) session.firstFrameMs = performance.now() - session.startedAt;
+    };
+}
+
+// Once a second, for cameras with stats turned on in the editor: stream type,
+// resolution, decoded fps, dropped frames, time to first frame, plus latency
+// (HLS) or the decoder in use (WebRTC) when available.
+async function updateCameraStats(session) {
+    if (cameraSession !== session) return;
+    const img = document.getElementById('cameraImage');
+    if (session.mode === 'mjpeg' && img.naturalWidth && !session.firstFrameMs) {
+        session.firstFrameMs = performance.now() - session.startedAt;
+    }
+    if (!session.showStats) {
+        setCameraStatus(session.firstFrameMs ? '' : 'Connecting…');
+        return;
+    }
+    const parts = [session.mode.toUpperCase()];
+    if (session.firstFrameMs) parts.push(`first frame ${(session.firstFrameMs / 1000).toFixed(1)}s`);
+
+    if (session.mode === 'mjpeg') {
+        if (img.naturalWidth) parts.splice(1, 0, `${img.naturalWidth}×${img.naturalHeight}`);
+        parts.push('fps n/a for MJPEG');
+        setCameraStatus(parts.join(' · '));
+        return;
+    }
+
+    const video = document.getElementById('cameraVideo');
+    if (!video.videoWidth) { setCameraStatus('Waiting for video…'); return; }
+    parts.splice(1, 0, `${video.videoWidth}×${video.videoHeight}`);
+
+    const quality = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
+    if (quality) {
+        const now = performance.now();
+        if (session.lastStatsAt) {
+            const fps = (quality.totalVideoFrames - session.lastFrames) * 1000 / (now - session.lastStatsAt);
+            parts.push(`${fps.toFixed(0)} fps`);
+        }
+        session.lastFrames = quality.totalVideoFrames;
+        session.lastStatsAt = now;
+        parts.push(`${quality.droppedVideoFrames} dropped`);
+    }
+
+    if (session.hls && Number.isFinite(session.hls.latency)) parts.push(`${session.hls.latency.toFixed(1)}s behind live`);
+    if (session.pc) {
+        const stats = await session.pc.getStats().catch(() => null);
+        stats && stats.forEach(report => {
+            if (report.type === 'inbound-rtp' && report.kind === 'video' && report.decoderImplementation) {
+                parts.push(`decoder ${report.decoderImplementation}`);
+            }
+        });
+    }
+    if (cameraSession === session) setCameraStatus(parts.join(' · '));
+}
+
+// ============================================
 // WEATHER FORECAST MODAL
 // ============================================
 function renderInlineForecastStrip(tile, forecast, forecastType = 'daily') {
@@ -4316,6 +4687,18 @@ async function init() {
     if (!connected) {
         showError('Cannot connect to Home Assistant');
         setTimeout(openAdmin, 2000);
+        return;
+    }
+
+    // ?camera=camera.front_door opens that camera's popup, so an automation can
+    // pop it up by pointing the panel at a URL. Dropped from the URL afterwards
+    // so a reload doesn't reopen it.
+    const cameraParam = urlParams.get('camera');
+    if (cameraParam && cameraParam.startsWith('camera.')) {
+        const params = new URLSearchParams(window.location.search);
+        params.delete('camera');
+        history.replaceState(null, '', '?' + params.toString());
+        openCameraModal(cameraParam);
     }
 }
 

@@ -1791,6 +1791,53 @@ body {
 }
 
 /* Alarm Control Modal */
+/* Camera stream modal: as wide as the panel allows, video letterboxed in 16:9 */
+.camera-modal-content {
+    width: 96%;
+    max-width: min(96%, 720px);
+}
+
+/* Big, obvious close target: the stream is easy to leave running otherwise */
+.camera-modal-close {
+    width: 56px;
+    height: 56px;
+    margin: -12px -12px -12px 12px;
+    padding: 0;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: rgba(var(--fg-rgb), 0.12);
+    color: rgba(var(--fg-rgb), 0.9);
+    font-size: 32px;
+}
+
+.camera-modal-close:active {
+    background: rgba(var(--fg-rgb), 0.25);
+}
+
+.camera-view {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #000;
+    border-radius: 12px;
+    overflow: hidden;
+}
+
+.camera-view video,
+.camera-view img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.camera-status {
+    min-height: 1.4em;
+    margin: 10px 0;
+    font-size: 12px;
+    opacity: 0.6;
+    text-align: center;
+}
+
 .alarm-status {
     text-align: center;
     margin-bottom: 24px;

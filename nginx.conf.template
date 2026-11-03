@@ -92,6 +92,9 @@ http {
             add_header Pragma "no-cache";
             add_header Expires "0";
             
+            # Stream responses (MJPEG camera feeds) straight through
+            proxy_buffering off;
+
             # Timeouts
             proxy_connect_timeout 30s;
             proxy_send_timeout 30s;
