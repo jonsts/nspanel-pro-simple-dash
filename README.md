@@ -190,7 +190,18 @@ Cameras that aren't in the room open with the defaults.
 
 ### Opening a camera from an automation
 
-Every panel listens for an `nspanel_open_camera` event, so an automation can pop a camera up instantly without reloading the page:
+**Recommended: `?camera=`.** Point the panel at the dashboard URL with `camera=` added, e.g. with Fully Kiosk's `load_url` action. The page reloads and opens the popup. This works with the normal (non-admin) dashboard token:
+
+```yaml
+actions:
+  - action: fully_kiosk.load_url
+    target:
+      device_id: <your panel>
+    data:
+      url: "http://dashboard:8080/?room=Hallway&camera=doorbell"
+```
+
+**Optional: Home Assistant events (no reload).** Every panel also listens for `nspanel_open_camera` / `nspanel_close_camera`, which open and close the popup instantly over the dashboard's existing connection:
 
 ```yaml
 actions:
@@ -201,18 +212,9 @@ actions:
       device: nspanel_abc123     # optional: only this panel (ID or list)
 ```
 
-Leave out `room` and `device` to open it on every panel. To close it again (e.g. when the ring is over), fire `nspanel_close_camera` with the same optional `room` / `device`; with an `entity_id` it only closes the popup if that camera is the one showing:
+Leave out `room` and `device` to target every panel. `nspanel_close_camera` takes the same optional `room` / `device`; with an `entity_id` it only closes the popup if that camera is the one showing. A panel's ID is shown under **Global Settings → Device**; it lives in that panel's browser storage, so it changes if the storage is cleared. Panels only hear events while the page is visible.
 
-```yaml
-actions:
-  - event: nspanel_close_camera
-    event_data:
-      entity_id: doorbell        # optional
-```
-
-A panel's ID is shown under **Global Settings → Device**; it lives in that panel's browser storage, so it changes if the storage is cleared.
-
-The events need the dashboard's token to belong to an admin user (Home Assistant only lets admins subscribe to custom events), and the panel only hears it while the page is visible. `?camera=` is the fallback for both: pointing the panel at the URL (e.g. with Fully Kiosk's `load_url`) reloads it and opens the popup.
+> ⚠️ **Events only work if the dashboard's token belongs to an admin user** (Home Assistant only lets admins subscribe to custom events). **Don't switch to an admin token for this yet:** the config API returns the stored token to anyone who can reach the dashboard on your network, and an admin token gives full control of Home Assistant. With a normal token the event subscription is simply skipped (a console warning) and everything else, including `?camera=`, keeps working.
 
 ## Customization
 

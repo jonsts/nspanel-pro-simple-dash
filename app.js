@@ -702,6 +702,12 @@ function flushPendingRenders() {
     if (config.headerTempEntity && ids.has(config.headerTempEntity)) updateHeaderTemp();
     if ([...ids].some(id => id.startsWith('media_player.'))) rerenderMediaPage();
     if (currentClimateEntity && ids.has(currentClimateEntity)) openClimateModal(currentClimateEntity);
+    // Keep an open alarm popup live (e.g. arming -> triggered), but don't
+    // redraw it under the code keypad while a code is being entered.
+    if (currentAlarmEntity && ids.has(currentAlarmEntity) && !alarmPendingAction && entityStates[currentAlarmEntity]) {
+        renderAlarmStatus(entityStates[currentAlarmEntity]);
+        renderAlarmModeSelector(currentAlarmEntity, entityStates[currentAlarmEntity]);
+    }
 }
 
 function rerenderTiles(entityId) {
@@ -3271,7 +3277,8 @@ async function saveRoom(mode) {
     const headerTempEntity = document.getElementById('headerTempEntityInput').value.trim();
     const screensaverWeather = document.getElementById('screensaverWeatherInput').value.trim();
     const wakeEntity = document.getElementById('wakeEntityInput').value.trim();
-    const headerCameraEntity = normalizeCameraEntityId(document.getElementById('headerCameraEntityInput').value.trim());
+    const headerCameraInput = document.getElementById('headerCameraEntityInput').value.trim();
+    const headerCameraEntity = normalizeCameraEntityId(headerCameraInput);
     const gridColumns = parseInt(document.getElementById('gridColumnsInput').value) || 2;
     const gridRows = parseInt(document.getElementById('gridRowsInput').value) || 2;
     const theme = document.getElementById('roomThemeInput').value;
@@ -3286,7 +3293,7 @@ async function saveRoom(mode) {
         return;
     }
 
-    if (headerCameraEntity && !VALID_ENTITY_ID.test(headerCameraEntity)) {
+    if (headerCameraInput && !headerCameraEntity) {
         showError('Header camera must be a camera entity, e.g. camera.doorbell');
         return;
     }
@@ -4129,7 +4136,7 @@ async function setAlarmMode(entityId, service, code) {
 // MJPEG, moving on when one fails or shows no picture in time.
 const CAMERA_STREAM_ORDER = ['webrtc', 'hls', 'mjpeg'];
 const CAMERA_FIRST_FRAME_TIMEOUT_MS = 10000;
-const HLS_JS_URL = 'https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js';
+const HLS_JS_URL = 'vendor/hls.min.js'; // hls.js 1.5.17, bundled so HLS works offline and no third-party script sees the token
 
 let cameraSession = null; // { entityId, mode, showStats, startedAt, socket, pc, hls, statsTimer, frameTimer, lastFrames, lastStatsAt }
 let hlsJsPromise = null;
@@ -4169,9 +4176,11 @@ function applyCameraShape(width, height) {
 
 // Camera ids may be given without their domain ("doorbell_fluent"): only
 // camera entities can stream, so the prefix is implied.
+// Returns '' for anything that isn't a valid camera entity id.
 function normalizeCameraEntityId(id) {
     if (!id) return '';
-    return id.startsWith('camera.') ? id : `camera.${id}`;
+    const entityId = id.startsWith('camera.') ? id : `camera.${id}`;
+    return VALID_ENTITY_ID.test(entityId) ? entityId : '';
 }
 
 // Automations fire these events to open / close a camera popup on panels
@@ -4190,12 +4199,13 @@ function isCameraEventForThisPanel(data) {
 
 function handleCameraEvent(data) {
     if (!isCameraEventForThisPanel(data)) return;
-    if (!data.entity_id) {
-        console.warn(`${CAMERA_EVENT_TYPE} needs an entity_id`);
+    const entityId = normalizeCameraEntityId(String(data.entity_id || ''));
+    if (!entityId) {
+        console.warn(`${CAMERA_EVENT_TYPE} needs a valid camera entity_id, got:`, data.entity_id);
         return;
     }
     if (document.getElementById('screensaver').classList.contains('active')) exitScreensaver();
-    openCameraModal(normalizeCameraEntityId(String(data.entity_id)));
+    openCameraModal(entityId);
 }
 
 // With an entity_id, only closes the popup if it's showing that camera, so one
@@ -4793,7 +4803,9 @@ async function init() {
         const params = new URLSearchParams(window.location.search);
         params.delete('camera');
         history.replaceState(null, '', '?' + params.toString());
-        openCameraModal(normalizeCameraEntityId(cameraParam));
+        const cameraEntityId = normalizeCameraEntityId(cameraParam);
+        if (cameraEntityId) openCameraModal(cameraEntityId);
+        else console.warn('Ignoring invalid ?camera= value:', cameraParam);
     }
 }
 

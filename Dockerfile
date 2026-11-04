@@ -19,6 +19,7 @@ COPY styles.css /usr/share/nginx/html/styles.css
 COPY app.js /usr/share/nginx/html/app.js
 COPY api.php /usr/share/nginx/html/api.php
 COPY sound.mp3 /usr/share/nginx/html/sound.mp3
+COPY vendor/ /usr/share/nginx/html/vendor/
 
 # Create data directory
 RUN mkdir -p /data && chown -R www-data:www-data /data
