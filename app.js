@@ -155,6 +155,36 @@ function formatWeatherCondition(state) {
         .replace(/\b\w/g, c => c.toUpperCase());
 }
 
+const ALARM_STATE_LABELS = {
+    armed_home: 'Armed Home',
+    armed_away: 'Armed Away',
+    armed_night: 'Armed Night',
+    armed_vacation: 'Armed Vacation',
+    armed_custom_bypass: 'Armed Custom',
+    pending: 'Pending',
+    arming: 'Arming',
+    disarming: 'Disarming',
+    triggered: 'Triggered',
+    disarmed: 'Disarmed'
+};
+
+// Format a Home Assistant alarm_control_panel state for display (e.g. "armed_night" -> "Armed Night")
+function formatAlarmState(state) {
+    if (!state) return 'Unknown';
+    return ALARM_STATE_LABELS[state] || state
+        .replace(/_/g, ' ')
+        .replace(/\b\w/g, c => c.toUpperCase());
+}
+
+// Buckets a raw alarm_control_panel state into a coarse category used for tile/modal coloring
+function alarmStateCategory(state) {
+    if (state === 'triggered') return 'triggered';
+    if (state === 'disarmed') return 'disarmed';
+    if (state === 'pending' || state === 'arming' || state === 'disarming') return 'pending';
+    if (state && state.startsWith('armed')) return 'armed';
+    return '';
+}
+
 async function loadConfig() {
     try {
         // Get device-specific identifier (use IP or generate unique ID)
@@ -228,6 +258,7 @@ async function saveConfig() {
             headerTempEntity: config.headerTempEntity,
             screensaverWeather: config.screensaverWeather,
             wakeEntity: config.wakeEntity,
+            headerCameraEntity: config.headerCameraEntity,
             gridColumns: config.gridColumns,
             gridRows: config.gridRows,
             theme: roomConfigs.find(r => r.roomName === config.roomName)?.theme || '',
@@ -347,6 +378,8 @@ let haSocket = null;
 let haSocketLive = false;      // authenticated, subscribed and first snapshot applied
 let haMsgId = 0;
 let haSubscriptionId = null;
+let haCameraEventSubId = null;
+let haCameraCloseSubId = null;
 let haRetryMs = 1000;
 let haRetryTimer = null;
 let haPingTimer = null;
@@ -483,6 +516,8 @@ function handleSocketMessage(msg) {
             break;
         case 'auth_ok':
             haSubscriptionId = sendSocketMessage({ type: 'subscribe_entities', entity_ids: watchedEntityIds });
+            haCameraEventSubId = sendSocketMessage({ type: 'subscribe_events', event_type: CAMERA_EVENT_TYPE });
+            haCameraCloseSubId = sendSocketMessage({ type: 'subscribe_events', event_type: CAMERA_CLOSE_EVENT_TYPE });
             break;
         case 'auth_invalid':
             console.error('Home Assistant rejected the token:', msg.message);
@@ -492,6 +527,9 @@ function handleSocketMessage(msg) {
             if (msg.id === haSubscriptionId && !msg.success) {
                 console.error('subscribe_entities failed:', msg.error);
                 socketDown();
+            } else if ((msg.id === haCameraEventSubId || msg.id === haCameraCloseSubId) && !msg.success) {
+                // Non-admin tokens can't subscribe to custom events; ?camera= still works.
+                console.warn("Can't listen for camera events (token needs an admin user):", msg.error);
             }
             break;
         case 'pong':
@@ -499,6 +537,8 @@ function handleSocketMessage(msg) {
             break;
         case 'event':
             if (msg.id === haSubscriptionId) applyEntityEvent(msg.event);
+            else if (msg.id === haCameraEventSubId) handleCameraEvent(msg.event.data || {});
+            else if (msg.id === haCameraCloseSubId) handleCameraCloseEvent(msg.event.data || {});
             break;
     }
 }
@@ -577,6 +617,8 @@ function closeSocket() {
     clearTimeout(haPongTimer);
     haSocketLive = false;
     haSubscriptionId = null;
+    haCameraEventSubId = null;
+    haCameraCloseSubId = null;
     if (haSocket) {
         const ws = haSocket;
         haSocket = null;
@@ -611,8 +653,12 @@ function resumeLiveStates() {
 }
 
 document.addEventListener('visibilitychange', () => {
-    if (document.hidden) pauseLiveStates();
-    else resumeLiveStates();
+    if (document.hidden) {
+        pauseLiveStates();
+        closeCameraModal(); // don't keep pulling video with the screen off
+    } else {
+        resumeLiveStates();
+    }
 });
 
 // A cancelled touch never reaches the slider's touchend, so release the render hold here.
@@ -656,6 +702,12 @@ function flushPendingRenders() {
     if (config.headerTempEntity && ids.has(config.headerTempEntity)) updateHeaderTemp();
     if ([...ids].some(id => id.startsWith('media_player.'))) rerenderMediaPage();
     if (currentClimateEntity && ids.has(currentClimateEntity)) openClimateModal(currentClimateEntity);
+    // Keep an open alarm popup live (e.g. arming -> triggered), but don't
+    // redraw it under the code keypad while a code is being entered.
+    if (currentAlarmEntity && ids.has(currentAlarmEntity) && !alarmPendingAction && entityStates[currentAlarmEntity]) {
+        renderAlarmStatus(entityStates[currentAlarmEntity]);
+        renderAlarmModeSelector(currentAlarmEntity, entityStates[currentAlarmEntity]);
+    }
 }
 
 function rerenderTiles(entityId) {
@@ -708,7 +760,7 @@ function renderPages() {
     pagesRendered = true;
 
     // Filter out media players from regular entities
-    const regularEntities = config.entities.filter(e => !e.id.startsWith('media_player.'));
+    const regularEntities = config.entities.filter(isGridEntity);
     const mediaPlayers = config.entities.filter(e => e.id.startsWith('media_player.'));
     
     // Add assistant command tiles to regular entities
@@ -791,6 +843,7 @@ function renderPages() {
 
     document.getElementById('roomName').textContent = config.roomName;
     updateHeaderTemp();
+    document.getElementById('headerCameraBtn').style.display = config.headerCameraEntity ? 'flex' : 'none';
     updateNowPlayingIndicator(mediaPlayers);
     updatePagePosition();
     scheduleClockTiles();
@@ -1220,8 +1273,14 @@ function updateNowPlayingIndicator(mediaPlayers) {
     }
 }
 
+// Entities that get a tile on the grid pages: media players have their own page,
+// and hidden cameras exist only for their popup settings (?camera=).
+function isGridEntity(entity) {
+    return !entity.id.startsWith('media_player.') && !entity.hideTile;
+}
+
 function goToMediaPage() {
-    const regularEntities = config.entities.filter(e => !e.id.startsWith('media_player.'));
+    const regularEntities = config.entities.filter(isGridEntity);
     const assistantCommandTiles = (config.assistantCommands || []).map(cmd => ({
         id: `assistant_command.${cmd.label.toLowerCase().replace(/\s+/g, '_')}`,
         label: cmd.label,
@@ -1295,8 +1354,13 @@ function openHeaderClimateModal() {
 }
 
 function applyTileSize(tile, entity) {
-    if (entity.tileColSpan && entity.tileColSpan > 1) {
-        tile.style.gridColumn = `span ${entity.tileColSpan}`;
+    const colSpan = entity.tileColSpan || 1;
+    tile.dataset.width = colSpan;
+    tile.dataset.height = entity.tileHeight === 'half' ? 'half' : 'full';
+    if (colSpan >= (config.gridColumns || 2)) tile.dataset.fullWidth = 'true';
+
+    if (colSpan > 1) {
+        tile.style.gridColumn = `span ${colSpan}`;
     }
     if (entity.tileHeight === 'half') tile.classList.add('tile-half-height');
 }
@@ -1335,6 +1399,10 @@ function createTile(entity, state) {
         return createWeatherTile(entity, state);
     } else if (domain === 'cover') {
         return createCoverTile(entity, state);
+    } else if (domain === 'alarm_control_panel') {
+        return createAlarmTile(entity, state);
+    } else if (domain === 'camera') {
+        return createCameraTile(entity, state);
     }
 
     const stateValue = state ? state.state : null;
@@ -1344,6 +1412,9 @@ function createTile(entity, state) {
     tile.classList.add(domain);
     if (isOn) {
         tile.classList.add('on');
+    }
+    if (domain === 'lock' && stateValue) {
+        tile.classList.add(`state--${stateValue}`);
     }
 
     if (isUnavailable) {
@@ -1858,7 +1929,9 @@ function getEntityIcon(domain, entityId) {
         'group': 'workspaces',
         'input_boolean': 'toggle_on',
         'automation': 'settings_suggest',
-        'weather': 'partly_cloudy_day'
+        'weather': 'partly_cloudy_day',
+        'alarm_control_panel': 'security',
+        'camera': 'videocam'
     };
 
     return iconMap[domain] || 'toggle_on';
@@ -1999,6 +2072,91 @@ function createSensorTile(entity, state) {
         tile.appendChild(gauge);
     } else {
         tile.appendChild(tempDisplay);
+    }
+
+    return tile;
+}
+
+function createAlarmTile(entity, state) {
+    const tile = document.createElement('div');
+    tile.className = 'tile alarm_control_panel';
+
+    const stateValue = state ? state.state : null;
+    const isUnavailable = !state || stateValue === 'unavailable';
+    const category = alarmStateCategory(stateValue);
+
+    if (category) tile.classList.add(category);
+
+    if (isUnavailable) {
+        tile.classList.add('unavailable');
+    } else if (entity.disableAction) {
+        tile.classList.add('no-action');
+    }
+
+    const icon = document.createElement('div');
+    icon.className = 'tile-icon';
+    icon.textContent = entity.icon || getEntityIcon('alarm_control_panel', entity.id);
+
+    const content = document.createElement('div');
+    content.className = 'tile-content';
+
+    const label = document.createElement('div');
+    label.className = 'tile-label';
+    label.textContent = entity.label;
+    content.appendChild(label);
+
+    if (!entity.hideState) {
+        const stateText = document.createElement('div');
+        stateText.className = 'tile-state';
+        stateText.textContent = formatAlarmState(stateValue).toUpperCase();
+        content.appendChild(stateText);
+    }
+
+    tile.appendChild(icon);
+    tile.appendChild(content);
+
+    if (!isUnavailable && !entity.disableAction) {
+        tile.onclick = () => openAlarmModal(entity.id);
+    }
+
+    return tile;
+}
+
+function createCameraTile(entity, state) {
+    const tile = document.createElement('div');
+    tile.className = 'tile camera';
+
+    const isUnavailable = !state || state.state === 'unavailable';
+    if (isUnavailable) {
+        tile.classList.add('unavailable');
+    } else if (entity.disableAction) {
+        tile.classList.add('no-action');
+    }
+
+    const icon = document.createElement('div');
+    icon.className = 'tile-icon';
+    icon.textContent = entity.icon || getEntityIcon('camera', entity.id);
+
+    const content = document.createElement('div');
+    content.className = 'tile-content';
+
+    const label = document.createElement('div');
+    label.className = 'tile-label';
+    label.textContent = entity.label;
+    content.appendChild(label);
+
+    if (!entity.hideState) {
+        const stateText = document.createElement('div');
+        stateText.className = 'tile-state';
+        stateText.textContent = isUnavailable ? 'UNAVAILABLE' : 'LIVE';
+        content.appendChild(stateText);
+    }
+
+    tile.appendChild(icon);
+    tile.appendChild(content);
+
+    if (!isUnavailable && !entity.disableAction) {
+        tile.onclick = () => openCameraModal(entity.id);
     }
 
     return tile;
@@ -2304,7 +2462,7 @@ function showError(message) {
 // PAGE NAVIGATION
 // ============================================
 function goToPage(pageIndex) {
-    const regularEntities = config.entities.filter(e => !e.id.startsWith('media_player.'));
+    const regularEntities = config.entities.filter(isGridEntity);
     const mediaPlayers = config.entities.filter(e => e.id.startsWith('media_player.'));
     const assistantCommandTiles = (config.assistantCommands || []).map(cmd => ({
         id: `assistant_command.${cmd.label.toLowerCase().replace(/\s+/g, '_')}`,
@@ -2342,7 +2500,7 @@ function updateDots() {
 }
 
 function nextPage() {
-    const regularEntities = config.entities.filter(e => !e.id.startsWith('media_player.'));
+    const regularEntities = config.entities.filter(isGridEntity);
     const mediaPlayers = config.entities.filter(e => e.id.startsWith('media_player.'));
     const assistantCommandTiles = (config.assistantCommands || []).map(cmd => ({
         id: `assistant_command.${cmd.label.toLowerCase().replace(/\s+/g, '_')}`,
@@ -2426,8 +2584,8 @@ function isWakeEntityOn() {
 }
 
 function enterScreensaver() {
-    // Stay awake while the room's motion sensor still reports presence
-    if (isWakeEntityOn()) {
+    // Stay awake while the room's motion sensor still reports presence, or a camera is open
+    if (isWakeEntityOn() || cameraSession) {
         resetInactivityTimer();
         return;
     }
@@ -2688,6 +2846,11 @@ function showGlobalSettings() {
         <div class="settings-section">
             <div class="settings-section-title">Device</div>
             <div class="form-group">
+                <label class="form-label">This Panel's ID</label>
+                <input type="text" class="form-input" value="${getDeviceId()}" readonly onclick="this.select()">
+                <small style="color: #888; font-size: 12px;">Use as <code>device</code> in an nspanel_open_camera event to target only this panel. Stored in this panel's browser, so it changes if its storage is cleared.</small>
+            </div>
+            <div class="form-group">
                 <label class="form-label">Model</label>
                 <select class="form-input" id="deviceModelInput">
                     <option value="pro" ${(globalConfig.deviceModel || 'pro') === 'pro' ? 'selected' : ''}>NSPanel Pro (480×480)</option>
@@ -2784,6 +2947,7 @@ function getRoomEditorCurrentState() {
         headerTempEntity: document.getElementById('headerTempEntityInput')?.value.trim() || '',
         screensaverWeather: document.getElementById('screensaverWeatherInput')?.value.trim() || '',
         wakeEntity: document.getElementById('wakeEntityInput')?.value.trim() || '',
+        headerCameraEntity: document.getElementById('headerCameraEntityInput')?.value.trim() || '',
         gridColumns: parseInt(document.getElementById('gridColumnsInput')?.value) || 2,
         gridRows: parseInt(document.getElementById('gridRowsInput')?.value) || 2,
         theme: document.getElementById('roomThemeInput')?.value || '',
@@ -2879,6 +3043,12 @@ function showRoomEditor(mode, roomIdx) {
             <label class="form-label">Wake Entity (Optional)</label>
             <input type="text" class="form-input" id="wakeEntityInput" placeholder="binary_sensor.bathroom_motion" value="${(roomData.wakeEntity || '').replace(/[&"<>]/g, c => `&#${c.charCodeAt(0)};`)}">
             <small style="color: #888; font-size: 12px;">Hides the screensaver while this entity is "on" (e.g. a motion sensor)</small>
+        </div>
+
+        <div class="form-group">
+            <label class="form-label">Header Camera (Optional)</label>
+            <input type="text" class="form-input" id="headerCameraEntityInput" placeholder="doorbell or camera.doorbell" value="${(roomData.headerCameraEntity || '').replace(/[&"<>]/g, c => `&#${c.charCodeAt(0)};`)}">
+            <small style="color: #888; font-size: 12px;">Adds a camera button to the header that opens this camera's popup. Use a fluent stream from HA for best performance</small>
         </div>
 
         <div class="form-group">
@@ -3006,6 +3176,7 @@ function showRoomEditor(mode, roomIdx) {
         headerTempEntity: roomData.headerTempEntity || '',
         screensaverWeather: roomData.screensaverWeather || '',
         wakeEntity: roomData.wakeEntity || '',
+        headerCameraEntity: roomData.headerCameraEntity || '',
         gridColumns: roomData.gridColumns || 2,
         gridRows: roomData.gridRows || 2,
         theme: roomData.theme || '',
@@ -3106,6 +3277,8 @@ async function saveRoom(mode) {
     const headerTempEntity = document.getElementById('headerTempEntityInput').value.trim();
     const screensaverWeather = document.getElementById('screensaverWeatherInput').value.trim();
     const wakeEntity = document.getElementById('wakeEntityInput').value.trim();
+    const headerCameraInput = document.getElementById('headerCameraEntityInput').value.trim();
+    const headerCameraEntity = normalizeCameraEntityId(headerCameraInput);
     const gridColumns = parseInt(document.getElementById('gridColumnsInput').value) || 2;
     const gridRows = parseInt(document.getElementById('gridRowsInput').value) || 2;
     const theme = document.getElementById('roomThemeInput').value;
@@ -3120,6 +3293,11 @@ async function saveRoom(mode) {
         return;
     }
 
+    if (headerCameraInput && !headerCameraEntity) {
+        showError('Header camera must be a camera entity, e.g. camera.doorbell');
+        return;
+    }
+
     if (!window.editingRoomData || !window.editingRoomData.entities || window.editingRoomData.entities.length === 0) {
         showError('Please add at least one entity');
         return;
@@ -3130,6 +3308,7 @@ async function saveRoom(mode) {
         headerTempEntity,
         screensaverWeather,
         wakeEntity,
+        headerCameraEntity,
         gridColumns,
         gridRows,
         theme,
@@ -3228,6 +3407,7 @@ function updateEntityFormForDomain() {
     document.getElementById('entityOptLight').style.display = domain === 'light' ? 'block' : 'none';
     document.getElementById('entityOptSensor').style.display = domain === 'sensor' ? 'flex' : 'none';
     document.getElementById('entityOptWeather').style.display = domain === 'weather' ? 'flex' : 'none';
+    document.getElementById('entityOptCamera').style.display = domain === 'camera' ? 'flex' : 'none';
     document.getElementById('entityOptClock').style.display = isClock ? 'flex' : 'none';
 
     // Inline forecast needs vertical room, so it's unavailable on half-height tiles
@@ -3278,6 +3458,9 @@ function openEntityModal(index) {
         document.getElementById('newEntityTileHeight').value = entity.tileHeight || 'normal';
         document.getElementById('newEntityHideClockDate').checked = entity.hideClockDate || false;
         document.getElementById('newEntityClockFormat').value = entity.clockTimeFormat || '';
+        document.getElementById('newEntityStreamType').value = entity.streamType || 'auto';
+        document.getElementById('newEntityShowStreamStats').checked = entity.showStreamStats || false;
+        document.getElementById('newEntityHideTile').checked = entity.hideTile || false;
     } else {
         document.getElementById('newEntityDomain').value = 'light';
         document.getElementById('newEntityId').value = '';
@@ -3303,6 +3486,9 @@ function openEntityModal(index) {
         document.getElementById('newEntityTileHeight').value = 'normal';
         document.getElementById('newEntityHideClockDate').checked = false;
         document.getElementById('newEntityClockFormat').value = '';
+        document.getElementById('newEntityStreamType').value = 'auto';
+        document.getElementById('newEntityShowStreamStats').checked = false;
+        document.getElementById('newEntityHideTile').checked = false;
     }
 
     // Populate width options based on current room column count
@@ -3375,6 +3561,12 @@ function saveEntityModal() {
         const clockFormat = document.getElementById('newEntityClockFormat').value;
         if (clockFormat) entity.clockTimeFormat = clockFormat;
     }
+    if (domain === 'camera') {
+        const streamType = document.getElementById('newEntityStreamType').value;
+        if (streamType && streamType !== 'auto') entity.streamType = streamType;
+        if (document.getElementById('newEntityShowStreamStats').checked) entity.showStreamStats = true;
+        if (document.getElementById('newEntityHideTile').checked) entity.hideTile = true;
+    }
     if (domain === 'weather') {
         if (document.getElementById('newEntityHideWeatherName').checked) entity.hideWeatherName = true;
         if (document.getElementById('newEntityHideWeatherIcon').checked) entity.hideWeatherIcon = true;
@@ -3422,6 +3614,7 @@ function refreshEntityList() {
 
         const iconText = entity.icon ? `<span style="font-family: 'Material Symbols Outlined'; font-size: 14px; color: #42a5f5; margin-right: 4px;">${entity.icon}</span>` : '';
         const hideStateText = entity.hideState ? '<span style="font-size: 10px; color: #888; margin-left: 8px;">[Hidden]</span>' : '';
+        const hideTileText = entity.hideTile ? '<span style="font-size: 10px; color: #888; margin-left: 8px;">[No tile]</span>' : '';
         const displayLabel = entity.label || (entity.id.startsWith('clock.') ? 'Clock' : entity.id);
 
         item.innerHTML = `
@@ -3431,7 +3624,7 @@ function refreshEntityList() {
                     <button class="reorder-btn" onclick="moveEntityDown(${idx})" ${idx === window.editingRoomData.entities.length - 1 ? 'disabled' : ''}>arrow_downward</button>
                 </div>
                 <div>
-                    <div>${iconText}<strong>${displayLabel}</strong>${hideStateText}</div>
+                    <div>${iconText}<strong>${displayLabel}</strong>${hideStateText}${hideTileText}</div>
                     <small style="color: #888;">${entity.id}</small>
                 </div>
             </div>
@@ -3750,6 +3943,561 @@ async function setClimateMode(entityId, mode) {
 }
 
 // ============================================
+// ALARM CONTROL MODAL
+// ============================================
+let currentAlarmEntity = null;
+let alarmPendingAction = null; // { entityId, service } while the code-entry screen is showing
+let alarmCodeBuffer = '';
+
+// alarm_control_panel supported_features bitmask (Home Assistant const.py)
+const ALARM_ARM_ACTIONS = [
+    { mode: 'armed_home', service: 'alarm_arm_home', label: 'Arm Home', bit: 1 },
+    { mode: 'armed_away', service: 'alarm_arm_away', label: 'Arm Away', bit: 2 },
+    { mode: 'armed_night', service: 'alarm_arm_night', label: 'Arm Night', bit: 4 },
+    { mode: 'armed_custom_bypass', service: 'alarm_arm_custom_bypass', label: 'Custom Bypass', bit: 16 },
+    { mode: 'armed_vacation', service: 'alarm_arm_vacation', label: 'Arm Vacation', bit: 32 }
+];
+
+const ALARM_STATUS_ICONS = {
+    disarmed: 'lock_open',
+    armed: 'lock',
+    pending: 'hourglass_top',
+    triggered: 'crisis_alert'
+};
+
+function openAlarmModal(entityId) {
+    currentAlarmEntity = entityId;
+    const state = entityStates[entityId];
+    if (!state) return;
+
+    const modal = document.getElementById('alarmModal');
+    const entity = config.entities.find(e => e.id === entityId);
+
+    document.getElementById('alarmModalTitle').textContent = entity ? entity.label : 'Alarm';
+
+    hideAlarmCodeEntry();
+    renderAlarmStatus(state);
+    renderAlarmModeSelector(entityId, state);
+
+    modal.classList.add('active');
+}
+
+function closeAlarmModal(event) {
+    if (event && event.target !== event.currentTarget) return;
+    document.getElementById('alarmModal').classList.remove('active');
+    currentAlarmEntity = null;
+    hideAlarmCodeEntry();
+}
+
+function renderAlarmStatus(state) {
+    const category = alarmStateCategory(state.state);
+    document.getElementById('alarmStatus').className = 'alarm-status' + (category ? ` ${category}` : '');
+    document.getElementById('alarmStatusText').textContent = formatAlarmState(state.state);
+    document.getElementById('alarmStatusIcon').textContent = ALARM_STATUS_ICONS[category] || 'security';
+}
+
+function renderAlarmModeSelector(entityId, state) {
+    const selector = document.getElementById('alarmModeSelector');
+    selector.innerHTML = '';
+
+    const supported = state.attributes.supported_features || 0;
+    const currentMode = state.state;
+
+    const disarmBtn = document.createElement('button');
+    disarmBtn.className = 'climate-mode-btn';
+    disarmBtn.textContent = 'Disarm';
+    if (currentMode === 'disarmed') disarmBtn.classList.add('active');
+    disarmBtn.onclick = () => requestAlarmAction(entityId, 'alarm_disarm', false);
+    selector.appendChild(disarmBtn);
+
+    ALARM_ARM_ACTIONS.forEach(action => {
+        if (!(supported & action.bit)) return;
+        const btn = document.createElement('button');
+        btn.className = 'climate-mode-btn';
+        btn.textContent = action.label;
+        if (currentMode === action.mode) btn.classList.add('active');
+        btn.onclick = () => requestAlarmAction(entityId, action.service, true);
+        selector.appendChild(btn);
+    });
+}
+
+function requestAlarmAction(entityId, service, isArmAction) {
+    const state = entityStates[entityId];
+    const codeFormat = state?.attributes.code_format;
+    const codeRequired = codeFormat && (isArmAction ? state.attributes.code_arm_required !== false : true);
+
+    if (codeRequired) {
+        showAlarmCodeEntry(entityId, service, codeFormat);
+    } else {
+        setAlarmMode(entityId, service, null);
+    }
+}
+
+function showAlarmCodeEntry(entityId, service, codeFormat) {
+    alarmPendingAction = { entityId, service };
+    alarmCodeBuffer = '';
+
+    document.getElementById('alarmStatus').style.display = 'none';
+    document.getElementById('alarmModeSelector').style.display = 'none';
+    document.getElementById('alarmCodeEntry').style.display = 'flex';
+
+    const isText = codeFormat === 'text';
+    document.getElementById('alarmCodeKeypad').style.display = isText ? 'none' : 'grid';
+    document.getElementById('alarmCodeDisplay').style.display = isText ? 'none' : 'block';
+
+    const textInput = document.getElementById('alarmCodeTextInput');
+    textInput.style.display = isText ? 'block' : 'none';
+    textInput.value = '';
+
+    updateAlarmCodeDisplay();
+    if (isText) setTimeout(() => textInput.focus(), 50);
+}
+
+function hideAlarmCodeEntry() {
+    alarmPendingAction = null;
+    alarmCodeBuffer = '';
+    const codeEntry = document.getElementById('alarmCodeEntry');
+    if (!codeEntry) return;
+    codeEntry.style.display = 'none';
+    document.getElementById('alarmStatus').style.removeProperty('display');
+    document.getElementById('alarmModeSelector').style.removeProperty('display');
+}
+
+function updateAlarmCodeDisplay() {
+    document.getElementById('alarmCodeDisplay').textContent = alarmCodeBuffer ? '•'.repeat(alarmCodeBuffer.length) : 'Enter code';
+}
+
+function pressAlarmCodeDigit(digit) {
+    alarmCodeBuffer += digit;
+    updateAlarmCodeDisplay();
+}
+
+function backspaceAlarmCode() {
+    alarmCodeBuffer = alarmCodeBuffer.slice(0, -1);
+    updateAlarmCodeDisplay();
+}
+
+function clearAlarmCode() {
+    alarmCodeBuffer = '';
+    updateAlarmCodeDisplay();
+}
+
+function cancelAlarmCodeEntry() {
+    hideAlarmCodeEntry();
+}
+
+function submitAlarmCode() {
+    if (!alarmPendingAction) return;
+    const { entityId, service } = alarmPendingAction;
+    const codeFormat = entityStates[entityId]?.attributes.code_format;
+    const code = codeFormat === 'text'
+        ? document.getElementById('alarmCodeTextInput').value.trim()
+        : alarmCodeBuffer;
+
+    if (!code) {
+        showError('Please enter the code');
+        return;
+    }
+
+    setAlarmMode(entityId, service, code);
+}
+
+async function setAlarmMode(entityId, service, code) {
+    try {
+        const body = { entity_id: entityId };
+        if (code) body.code = code;
+        await callHA(`services/alarm_control_panel/${service}`, 'POST', body);
+
+        hideAlarmCodeEntry();
+
+        setTimeout(() => {
+            getStates().then(() => {
+                renderPages();
+                const state = entityStates[entityId];
+                if (currentAlarmEntity === entityId && state) {
+                    renderAlarmStatus(state);
+                    renderAlarmModeSelector(entityId, state);
+                }
+            });
+        }, 300);
+    } catch (error) {
+        console.error('Failed to set alarm mode:', error);
+        showError('Failed to change alarm mode — check the code and try again');
+        alarmCodeBuffer = '';
+        updateAlarmCodeDisplay();
+    }
+}
+
+// ============================================
+// CAMERA STREAM MODAL
+// ============================================
+// The stream type is set per camera in the entity editor. 'auto' tries WebRTC
+// (HA's built-in go2rtc: lowest latency, hardware decode), then HLS, then
+// MJPEG, moving on when one fails or shows no picture in time.
+const CAMERA_STREAM_ORDER = ['webrtc', 'hls', 'mjpeg'];
+const CAMERA_FIRST_FRAME_TIMEOUT_MS = 10000;
+const HLS_JS_URL = 'vendor/hls.min.js'; // hls.js 1.5.17, bundled so HLS works offline and no third-party script sees the token
+
+let cameraSession = null; // { entityId, mode, showStats, startedAt, socket, pc, hls, statsTimer, frameTimer, lastFrames, lastStatsAt }
+let hlsJsPromise = null;
+
+// The camera doesn't have to be on the room's grid (e.g. opened from ?camera=);
+// without a tile it uses the default stream settings.
+// Only one camera shows at a time: opening another replaces the current
+// stream (startCameraStream stops it first). Re-opening the camera that's
+// already showing (e.g. the doorbell pressed twice) keeps the running stream.
+function openCameraModal(entityId) {
+    if (cameraSession && cameraSession.entityId === entityId && !cameraSession.failed) return;
+    const entity = config.entities.find(e => e.id === entityId);
+    const friendlyName = entityStates[entityId]?.attributes.friendly_name;
+    document.getElementById('cameraModalTitle').textContent = entity?.label || friendlyName || 'Camera';
+    document.getElementById('cameraModal').classList.add('active');
+    applyCameraShape(16, 9); // until the first frame says otherwise
+
+    const streamType = entity?.streamType || 'auto';
+    const modes = streamType === 'auto' ? CAMERA_STREAM_ORDER : [streamType];
+    startCameraStream(entityId, modes, !!entity?.showStreamStats);
+}
+
+function closeCameraModal(event) {
+    if (event && event.target !== event.currentTarget) return;
+    stopCameraStream();
+    document.getElementById('cameraModal').classList.remove('active');
+}
+
+// Sizes the video area to the camera's own shape. Portrait cameras (most
+// doorbells) are sized by the available height instead of the width.
+function applyCameraShape(width, height) {
+    const view = document.querySelector('.camera-view');
+    view.style.aspectRatio = `${width} / ${height}`;
+    view.style.setProperty('--camera-ratio', height / width);
+    document.querySelector('.camera-modal-content').classList.toggle('portrait', height > width);
+}
+
+// Camera ids may be given without their domain ("doorbell_fluent"): only
+// camera entities can stream, so the prefix is implied.
+// Returns '' for anything that isn't a valid camera entity id.
+function normalizeCameraEntityId(id) {
+    if (!id) return '';
+    const entityId = id.startsWith('camera.') ? id : `camera.${id}`;
+    return VALID_ENTITY_ID.test(entityId) ? entityId : '';
+}
+
+// Automations fire these events to open / close a camera popup on panels
+// without a page reload. Every panel hears them; optional `room` / `device`
+// (a name or a list) narrow them to the panels showing that room or with that
+// panel ID.
+//   event: nspanel_open_camera   event_data: { entity_id: doorbell, room: Hallway, device: nspanel_abc123 }
+//   event: nspanel_close_camera  event_data: { entity_id: doorbell, room: Hallway }  (all optional)
+const CAMERA_EVENT_TYPE = 'nspanel_open_camera';
+const CAMERA_CLOSE_EVENT_TYPE = 'nspanel_close_camera';
+
+function isCameraEventForThisPanel(data) {
+    const matches = (target, value) => target === undefined || [].concat(target).map(String).includes(value);
+    return matches(data.room, config.roomName) && matches(data.device, getDeviceId());
+}
+
+function handleCameraEvent(data) {
+    if (!isCameraEventForThisPanel(data)) return;
+    const entityId = normalizeCameraEntityId(String(data.entity_id || ''));
+    if (!entityId) {
+        console.warn(`${CAMERA_EVENT_TYPE} needs a valid camera entity_id, got:`, data.entity_id);
+        return;
+    }
+    if (document.getElementById('screensaver').classList.contains('active')) exitScreensaver();
+    openCameraModal(entityId);
+}
+
+// With an entity_id, only closes the popup if it's showing that camera, so one
+// camera's automation doesn't close another's.
+function handleCameraCloseEvent(data) {
+    if (!cameraSession || !isCameraEventForThisPanel(data)) return;
+    if (data.entity_id && normalizeCameraEntityId(String(data.entity_id)) !== cameraSession.entityId) return;
+    closeCameraModal();
+}
+
+function openHeaderCamera() {
+    if (config.headerCameraEntity) openCameraModal(config.headerCameraEntity);
+}
+
+function setCameraStatus(text) {
+    document.getElementById('cameraStatus').textContent = text;
+}
+
+async function startCameraStream(entityId, modes, showStats) {
+    stopCameraStream();
+    const [mode, ...fallbacks] = modes;
+    const session = { entityId, mode, showStats, startedAt: performance.now(), lastFrames: 0, lastStatsAt: 0 };
+    cameraSession = session;
+    setCameraStatus('Connecting…');
+
+    const video = document.getElementById('cameraVideo');
+    const img = document.getElementById('cameraImage');
+    video.style.display = mode === 'mjpeg' ? 'none' : 'block';
+    video.onresize = () => { if (video.videoWidth) applyCameraShape(video.videoWidth, video.videoHeight); };
+    img.style.display = mode === 'mjpeg' ? 'block' : 'none';
+
+    const fail = (message) => {
+        if (cameraSession !== session) return;
+        console.error(`Camera ${mode} stream failed:`, message);
+        if (fallbacks.length) startCameraStream(entityId, fallbacks, showStats);
+        else {
+            session.failed = true; // lets a re-open of this camera retry
+            setCameraStatus('Camera stream unavailable');
+        }
+    };
+    session.fail = fail;
+    // Browsers don't reliably fire load for MJPEG, so a decoded size counts as a picture too.
+    session.frameTimer = setTimeout(() => {
+        if (!session.firstFrameMs && !(mode === 'mjpeg' && img.naturalWidth)) fail('no picture in time');
+    }, CAMERA_FIRST_FRAME_TIMEOUT_MS);
+
+    try {
+        if (mode === 'mjpeg') {
+            await startMjpegStream(session, img);
+        } else {
+            session.socket = await openCameraSocket();
+            if (cameraSession !== session) { session.socket.close(); return; }
+            if (mode === 'hls') await startHlsStream(session, video);
+            else await startWebRtcStream(session, video);
+        }
+    } catch (error) {
+        fail(error.message);
+        return;
+    }
+    if (cameraSession === session) session.statsTimer = setInterval(() => updateCameraStats(session), 1000);
+}
+
+function stopCameraStream() {
+    const session = cameraSession;
+    cameraSession = null;
+    if (!session) return;
+
+    clearInterval(session.statsTimer);
+    clearTimeout(session.frameTimer);
+    if (session.hls) session.hls.destroy();
+    if (session.pc) session.pc.close();
+    if (session.socket) session.socket.close();
+
+    const video = document.getElementById('cameraVideo');
+    video.pause();
+    video.srcObject = null;
+    video.removeAttribute('src');
+    video.load();
+    // Clearing src is what makes the browser drop an MJPEG connection.
+    document.getElementById('cameraImage').removeAttribute('src');
+}
+
+// A short-lived socket just for stream negotiation, kept apart from the state
+// subscription so closing the popup tears everything down in one go.
+function openCameraSocket() {
+    return new Promise((resolve, reject) => {
+        const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${protocol}//${location.host}/api/websocket`);
+        const handlers = {};
+        let nextId = 0;
+
+        const socket = {
+            close() { ws.onclose = null; try { ws.close(); } catch (e) { /* already closed */ } },
+            // onMessage receives every message for this id (result and events).
+            send(msg, onMessage) {
+                msg.id = ++nextId;
+                if (onMessage) handlers[msg.id] = onMessage;
+                ws.send(JSON.stringify(msg));
+                return msg.id;
+            },
+            request(msg) {
+                return new Promise((res, rej) => socket.send(msg, reply => {
+                    if (reply.type !== 'result') return;
+                    if (reply.success) res(reply.result);
+                    else rej(new Error(reply.error?.message || 'request failed'));
+                }));
+            }
+        };
+
+        ws.onmessage = (event) => {
+            let msg;
+            try { msg = JSON.parse(event.data); } catch (e) { return; }
+            if (msg.type === 'auth_required') ws.send(JSON.stringify({ type: 'auth', access_token: globalConfig.haToken }));
+            else if (msg.type === 'auth_ok') resolve(socket);
+            else if (msg.type === 'auth_invalid') reject(new Error('token rejected'));
+            else if (handlers[msg.id]) handlers[msg.id](msg);
+        };
+        ws.onerror = () => reject(new Error('socket error'));
+        ws.onclose = () => {
+            reject(new Error('socket closed'));
+            if (cameraSession && cameraSession.socket === socket) cameraSession.fail('socket closed');
+        };
+    });
+}
+
+async function startMjpegStream(session, img) {
+    // Cameras that aren't on the grid aren't in the live states, so ask for the token.
+    const state = entityStates[session.entityId] || await fetchEntityState(session.entityId);
+    if (cameraSession !== session) return;
+    const token = state?.attributes.access_token;
+    if (!token) throw new Error('no camera access token');
+    img.onload = () => { if (cameraSession === session) session.firstFrameMs = performance.now() - session.startedAt; };
+    img.onerror = () => session.fail('image failed to load');
+    img.src = `/api/camera_proxy_stream/${session.entityId}?token=${encodeURIComponent(token)}`;
+}
+
+async function startHlsStream(session, video) {
+    const { url } = await session.socket.request({ type: 'camera/stream', entity_id: session.entityId, format: 'hls' });
+    if (cameraSession !== session) return;
+    watchFirstFrame(session, video);
+
+    // Prefer hls.js (MSE) over the WebView's native HLS: it plays closer to the live edge.
+    const Hls = await loadHlsJs().catch(() => null);
+    if (cameraSession !== session) return;
+    if (Hls && Hls.isSupported()) {
+        session.hls = new Hls({ lowLatencyMode: true, liveSyncDurationCount: 1, backBufferLength: 0 });
+        session.hls.loadSource(url);
+        session.hls.attachMedia(video);
+        session.hls.on(Hls.Events.ERROR, (_, data) => {
+            if (data.fatal) session.fail(data.details);
+        });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = url;
+    } else {
+        throw new Error('this browser cannot play HLS');
+    }
+    video.play().catch(() => {});
+}
+
+function loadHlsJs() {
+    if (window.Hls) return Promise.resolve(window.Hls);
+    if (!hlsJsPromise) {
+        hlsJsPromise = new Promise((resolve, reject) => {
+            const script = document.createElement('script');
+            script.src = HLS_JS_URL;
+            script.onload = () => resolve(window.Hls);
+            script.onerror = () => { hlsJsPromise = null; reject(new Error('could not load hls.js')); };
+            document.head.appendChild(script);
+        });
+    }
+    return hlsJsPromise;
+}
+
+// Home Assistant 2024.11+ WebRTC signalling: the offer subscription streams back
+// session/answer/candidate events, and our ICE candidates go up as separate messages.
+async function startWebRtcStream(session, video) {
+    const { entityId, socket } = session;
+    const clientConfig = await socket.request({ type: 'camera/webrtc/get_client_config', entity_id: entityId });
+    if (cameraSession !== session) return;
+
+    const pc = new RTCPeerConnection(clientConfig.configuration);
+    session.pc = pc;
+    if (clientConfig.dataChannel) pc.createDataChannel(clientConfig.dataChannel);
+    pc.addTransceiver('video', { direction: 'recvonly' });
+    pc.addTransceiver('audio', { direction: 'recvonly' });
+    pc.ontrack = (event) => {
+        if (!video.srcObject) video.srcObject = event.streams[0] || new MediaStream();
+        if (!event.streams[0]) video.srcObject.addTrack(event.track);
+        video.play().catch(() => {});
+    };
+    pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'failed') session.fail('connection failed');
+    };
+    watchFirstFrame(session, video);
+
+    let sessionId = null;
+    const pendingCandidates = [];
+    const sendCandidate = (candidate) => socket.send({
+        type: 'camera/webrtc/candidate', entity_id: entityId, session_id: sessionId, candidate
+    });
+    pc.onicecandidate = (event) => {
+        if (!event.candidate) return;
+        const candidate = event.candidate.toJSON();
+        if (sessionId) sendCandidate(candidate);
+        else pendingCandidates.push(candidate);
+    };
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    if (cameraSession !== session) return;
+
+    await new Promise((resolve, reject) => {
+        socket.send({ type: 'camera/webrtc/offer', entity_id: entityId, offer: offer.sdp }, async (msg) => {
+            if (msg.type === 'result') {
+                if (!msg.success) reject(new Error(msg.error?.message || 'offer rejected'));
+                return;
+            }
+            const event = msg.event;
+            if (event.type === 'session') {
+                sessionId = event.session_id;
+                pendingCandidates.splice(0).forEach(sendCandidate);
+            } else if (event.type === 'answer') {
+                await pc.setRemoteDescription({ type: 'answer', sdp: event.answer });
+                resolve();
+            } else if (event.type === 'candidate') {
+                pc.addIceCandidate(event.candidate).catch(() => {});
+            } else if (event.type === 'error') {
+                reject(new Error(event.message || event.code));
+            }
+        });
+    });
+}
+
+function watchFirstFrame(session, video) {
+    video.onloadeddata = () => {
+        if (cameraSession === session && !session.firstFrameMs) session.firstFrameMs = performance.now() - session.startedAt;
+    };
+}
+
+// Once a second, for cameras with stats turned on in the editor: stream type,
+// resolution, decoded fps, dropped frames, time to first frame, plus latency
+// (HLS) or the decoder in use (WebRTC) when available.
+async function updateCameraStats(session) {
+    if (cameraSession !== session) return;
+    const img = document.getElementById('cameraImage');
+    if (session.mode === 'mjpeg' && img.naturalWidth) {
+        if (!session.firstFrameMs) session.firstFrameMs = performance.now() - session.startedAt;
+        applyCameraShape(img.naturalWidth, img.naturalHeight);
+    }
+    if (!session.showStats) {
+        setCameraStatus(session.firstFrameMs ? '' : 'Connecting…');
+        return;
+    }
+    const parts = [session.mode.toUpperCase()];
+    if (session.firstFrameMs) parts.push(`first frame ${(session.firstFrameMs / 1000).toFixed(1)}s`);
+
+    if (session.mode === 'mjpeg') {
+        if (img.naturalWidth) parts.splice(1, 0, `${img.naturalWidth}×${img.naturalHeight}`);
+        parts.push('fps n/a for MJPEG');
+        setCameraStatus(parts.join(' · '));
+        return;
+    }
+
+    const video = document.getElementById('cameraVideo');
+    if (!video.videoWidth) { setCameraStatus('Waiting for video…'); return; }
+    parts.splice(1, 0, `${video.videoWidth}×${video.videoHeight}`);
+
+    const quality = video.getVideoPlaybackQuality ? video.getVideoPlaybackQuality() : null;
+    if (quality) {
+        const now = performance.now();
+        if (session.lastStatsAt) {
+            const fps = (quality.totalVideoFrames - session.lastFrames) * 1000 / (now - session.lastStatsAt);
+            parts.push(`${fps.toFixed(0)} fps`);
+        }
+        session.lastFrames = quality.totalVideoFrames;
+        session.lastStatsAt = now;
+        parts.push(`${quality.droppedVideoFrames} dropped`);
+    }
+
+    if (session.hls && Number.isFinite(session.hls.latency)) parts.push(`${session.hls.latency.toFixed(1)}s behind live`);
+    if (session.pc) {
+        const stats = await session.pc.getStats().catch(() => null);
+        stats && stats.forEach(report => {
+            if (report.type === 'inbound-rtp' && report.kind === 'video' && report.decoderImplementation) {
+                parts.push(`decoder ${report.decoderImplementation}`);
+            }
+        });
+    }
+    if (cameraSession === session) setCameraStatus(parts.join(' · '));
+}
+
+// ============================================
 // WEATHER FORECAST MODAL
 // ============================================
 function renderInlineForecastStrip(tile, forecast, forecastType = 'daily') {
@@ -4044,6 +4792,20 @@ async function init() {
     if (!connected) {
         showError('Cannot connect to Home Assistant');
         setTimeout(openAdmin, 2000);
+        return;
+    }
+
+    // ?camera=front_door (or camera.front_door) opens that camera's popup, so an
+    // automation can pop it up by pointing the panel at a URL. Dropped from the
+    // URL afterwards so a reload doesn't reopen it.
+    const cameraParam = urlParams.get('camera');
+    if (cameraParam) {
+        const params = new URLSearchParams(window.location.search);
+        params.delete('camera');
+        history.replaceState(null, '', '?' + params.toString());
+        const cameraEntityId = normalizeCameraEntityId(cameraParam);
+        if (cameraEntityId) openCameraModal(cameraEntityId);
+        else console.warn('Ignoring invalid ?camera= value:', cameraParam);
     }
 }
 

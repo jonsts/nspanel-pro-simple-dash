@@ -22,6 +22,9 @@
                     </div>
                 </div>
                 <div class="header-right">
+                    <button class="phone-btn" id="headerCameraBtn" onclick="openHeaderCamera()" title="Camera" style="display: none;">
+                        <span class="material-symbols-outlined">videocam</span>
+                    </button>
                     <button class="phone-btn" id="phoneBtn" onclick="openVoiceMessageModal()" title="Voice Messages">
                         <span class="material-symbols-outlined">phone</span>
                         <span class="phone-badge" id="phoneBadge" style="display: none;">0</span>
@@ -87,6 +90,64 @@
                 </div>
                 <div class="climate-mode-selector" id="climateModeSelector">
                     <!-- Mode buttons will be generated here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Camera Stream Modal -->
+    <div class="climate-modal" id="cameraModal" onclick="closeCameraModal(event)">
+        <div class="climate-modal-content camera-modal-content" onclick="event.stopPropagation()">
+            <div class="climate-modal-header">
+                <div class="climate-modal-title" id="cameraModalTitle">Camera</div>
+                <button class="climate-modal-close camera-modal-close" onclick="closeCameraModal()" aria-label="Close camera">close</button>
+            </div>
+            <div class="climate-modal-body">
+                <div class="camera-view">
+                    <video id="cameraVideo" autoplay muted playsinline></video>
+                    <img id="cameraImage" alt="" style="display: none;">
+                </div>
+                <div class="camera-status" id="cameraStatus"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Alarm Control Modal -->
+    <div class="climate-modal" id="alarmModal" onclick="closeAlarmModal(event)">
+        <div class="climate-modal-content" onclick="event.stopPropagation()">
+            <div class="climate-modal-header">
+                <div class="climate-modal-title" id="alarmModalTitle">Alarm</div>
+                <button class="climate-modal-close" onclick="closeAlarmModal()">close</button>
+            </div>
+            <div class="climate-modal-body">
+                <div class="alarm-status" id="alarmStatus">
+                    <div class="alarm-status-icon" id="alarmStatusIcon">security</div>
+                    <div class="alarm-status-text" id="alarmStatusText">Unknown</div>
+                </div>
+                <div class="climate-mode-selector" id="alarmModeSelector">
+                    <!-- Arm/disarm buttons will be generated here -->
+                </div>
+                <div class="alarm-code-entry" id="alarmCodeEntry">
+                    <div class="alarm-code-display" id="alarmCodeDisplay">Enter code</div>
+                    <input type="password" inputmode="text" class="form-input alarm-code-text-input" id="alarmCodeTextInput" placeholder="Enter code" aria-label="Alarm code" style="display: none;">
+                    <div class="alarm-code-keypad" id="alarmCodeKeypad">
+                        <button class="alarm-code-key" onclick="pressAlarmCodeDigit('1')">1</button>
+                        <button class="alarm-code-key" onclick="pressAlarmCodeDigit('2')">2</button>
+                        <button class="alarm-code-key" onclick="pressAlarmCodeDigit('3')">3</button>
+                        <button class="alarm-code-key" onclick="pressAlarmCodeDigit('4')">4</button>
+                        <button class="alarm-code-key" onclick="pressAlarmCodeDigit('5')">5</button>
+                        <button class="alarm-code-key" onclick="pressAlarmCodeDigit('6')">6</button>
+                        <button class="alarm-code-key" onclick="pressAlarmCodeDigit('7')">7</button>
+                        <button class="alarm-code-key" onclick="pressAlarmCodeDigit('8')">8</button>
+                        <button class="alarm-code-key" onclick="pressAlarmCodeDigit('9')">9</button>
+                        <button class="alarm-code-key" onclick="clearAlarmCode()" aria-label="Clear code">C</button>
+                        <button class="alarm-code-key" onclick="pressAlarmCodeDigit('0')">0</button>
+                        <button class="alarm-code-key" onclick="backspaceAlarmCode()" aria-label="Backspace">⌫</button>
+                    </div>
+                    <div class="alarm-code-actions">
+                        <button class="remove-btn" onclick="cancelAlarmCodeEntry()">Cancel</button>
+                        <button class="save-btn" onclick="submitAlarmCode()">Submit</button>
+                    </div>
                 </div>
             </div>
         </div>
@@ -171,6 +232,8 @@
                                 <option value="media_player">media_player</option>
                                 <option value="cover">cover</option>
                                 <option value="lock">lock</option>
+                                <option value="alarm_control_panel">alarm_control_panel</option>
+                                <option value="camera">camera</option>
                                 <option value="fan">fan</option>
                                 <option value="group">group</option>
                                 <option value="input_boolean">input_boolean</option>
@@ -237,6 +300,23 @@
                             <input type="number" id="newEntityGaugeRed" class="form-input" placeholder="Red from" aria-label="Gauge red threshold" style="width: 100px; padding: 6px 8px;">
                         </div>
                         <small style="color: #888; font-size: 12px;">Below yellow = green. Leave both empty for a blue → red gradient.</small>
+                    </div>
+                    <div id="entityOptCamera" style="display: none; flex-direction: column; gap: 8px;">
+                        <label class="form-label" for="newEntityStreamType">Stream type</label>
+                        <select id="newEntityStreamType" class="form-input" style="padding: 6px 8px;">
+                            <option value="auto">Auto (WebRTC → HLS → MJPEG)</option>
+                            <option value="webrtc">WebRTC</option>
+                            <option value="hls">HLS</option>
+                            <option value="mjpeg">MJPEG</option>
+                        </select>
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="newEntityShowStreamStats" aria-label="Show stream stats" style="width: 18px; height: 18px; cursor: pointer;">
+                            <span style="font-size: 13px; color: #888;">Show stream stats (fps, latency, decoder)</span>
+                        </label>
+                        <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">
+                            <input type="checkbox" id="newEntityHideTile" aria-label="Hide tile" style="width: 18px; height: 18px; cursor: pointer;">
+                            <span style="font-size: 13px; color: #888;">Hide tile (popup only, opened by URL or automation)</span>
+                        </label>
                     </div>
                     <div id="entityOptWeather" style="display: none; flex-direction: column; gap: 8px;">
                         <label style="display: flex; align-items: center; gap: 8px; cursor: pointer;">

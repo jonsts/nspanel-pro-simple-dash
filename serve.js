@@ -40,19 +40,14 @@ function body(req) {
   });
 }
 
-function setCors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Authorization, Content-Type');
-}
-
 async function handleConfigApi(req, res) {
   const url = new URL(req.url, `http://localhost`);
   const p = url.searchParams.get('path') || '';
   const method = req.method;
 
+  // No CORS headers (same as api.php): the dashboard is same-origin, and
+  // allowing any origin would let other websites read the stored HA token.
   res.setHeader('Content-Type', 'application/json');
-  setCors(res);
 
   const globalFile = dataFile('global_config.json');
   const roomsFile = dataFile('room_configs.json');
@@ -124,8 +119,6 @@ async function handleConfigApi(req, res) {
 }
 
 function proxyToHA(req, res) {
-  setCors(res);
-
   if (req.method === 'OPTIONS') {
     res.statusCode = 204;
     res.end();
@@ -222,7 +215,7 @@ const server = http.createServer(async (req, res) => {
   const urlPath = req.url.split('?')[0];
 
   try {
-    if (req.method === 'OPTIONS') { setCors(res); res.statusCode = 204; res.end(); return; }
+    if (req.method === 'OPTIONS') { res.statusCode = 204; res.end(); return; }
     if (urlPath === '/config-api.php') { await handleConfigApi(req, res); return; }
     if (urlPath.startsWith('/api/')) { proxyToHA(req, res); return; }
     serveStatic(req, res);

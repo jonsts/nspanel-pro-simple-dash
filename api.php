@@ -1,8 +1,7 @@
 <?php
 header('Content-Type: application/json');
-header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Methods: GET, POST, PUT, DELETE');
-header('Access-Control-Allow-Headers: Content-Type');
+// No CORS headers: the dashboard is served from this same origin, and
+// allowing any origin would let other websites read the stored HA token.
 
 $dataDir = '/data';
 $globalConfigFile = "$dataDir/global_config.json";

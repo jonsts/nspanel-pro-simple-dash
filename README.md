@@ -11,6 +11,7 @@ A modern, touch-friendly Home Assistant dashboard built for NSPanel displays (48
 - 🎵 Full media player page (album art background, transport controls, volume, shuffle/repeat) plus Google Assistant voice commands and Spotify playlist tiles
 - 🌦️ Weather tiles with inline forecast strip and a tap-to-open forecast modal
 - 🔒 Lock tiles with color-coded locked/unlocked state
+- 📹 Camera stream popups (WebRTC / HLS / MJPEG) from tiles, a header button, a URL param, or a Home Assistant event
 - 🗣️ Inter-room voice messages (record and broadcast audio between panels)
 - 🌙 Screensaver with clock, date, temperature, and weather
 - 🛠️ In-browser entity editor (icon picker, per-entity display options) — no JSON editing needed
@@ -112,6 +113,7 @@ Leaving the room editor with unsaved changes prompts a confirmation before disca
 | `light` | Toggle; swipe up/down on the tile to adjust brightness (unless dimming is disabled) |
 | `switch`, `input_boolean`, `group`, `fan` | Toggle |
 | `lock` | Toggle lock/unlock; red when locked, green when unlocked |
+| `alarm_control_panel` | Shows current state (disarmed/armed/pending/triggered); tap opens a modal with arm/disarm mode buttons and an on-screen code entry if the entity requires one |
 | `cover` | Toggle; swipe to set position if the entity supports it |
 | `climate` | Opens a modal with current/target temperature and HVAC mode buttons |
 | `scene`, `script`, `automation` | Trigger/activate |
@@ -172,6 +174,47 @@ Tap the phone icon in the header to record a short (max 30s) audio message and s
 | `?mode=new\|edit&room=RoomName` | Open the room editor in a specific mode |
 | `?debug=true` | Show persistent edit/settings buttons instead of relying on long-press |
 | `?screensaver=true` | Standalone screensaver mode |
+| `?camera=front_door` | Open `camera.front_door`'s stream popup on load (e.g. from a doorbell automation); the `camera.` prefix is optional. Works with `room=` and for cameras that aren't on the grid |
+
+## Camera Popups
+
+Camera entities open a live stream popup: from a grid tile, from the header camera button (set per room in the room editor), from `?camera=`, or from a Home Assistant event. Use the Reolink "fluent" (substream) entity for best performance.
+
+Per-camera options in the entity editor:
+
+- **Stream type** — Auto (default) tries WebRTC, then HLS, then MJPEG, moving on if one fails or shows no picture within 10s. WebRTC needs Home Assistant 2024.11+.
+- **Show stream stats** — resolution, fps, dropped frames, time to first frame, latency (HLS) and decoder (WebRTC)
+- **Hide tile** — keep the camera's settings without a grid tile, for cameras only opened by the header button, URL or an automation
+
+Cameras that aren't in the room open with the defaults.
+
+### Opening a camera from an automation
+
+**Recommended: `?camera=`.** Point the panel at the dashboard URL with `camera=` added, e.g. with Fully Kiosk's `load_url` action. The page reloads and opens the popup. This works with the normal (non-admin) dashboard token:
+
+```yaml
+actions:
+  - action: fully_kiosk.load_url
+    target:
+      device_id: <your panel>
+    data:
+      url: "http://dashboard:8080/?room=Hallway&camera=doorbell"
+```
+
+**Optional: Home Assistant events (no reload).** Every panel also listens for `nspanel_open_camera` / `nspanel_close_camera`, which open and close the popup instantly over the dashboard's existing connection:
+
+```yaml
+actions:
+  - event: nspanel_open_camera
+    event_data:
+      entity_id: doorbell        # camera. prefix optional
+      room: Hallway              # optional: only panels showing this room (name or list)
+      device: nspanel_abc123     # optional: only this panel (ID or list)
+```
+
+Leave out `room` and `device` to target every panel. `nspanel_close_camera` takes the same optional `room` / `device`; with an `entity_id` it only closes the popup if that camera is the one showing. A panel's ID is shown under **Global Settings → Device**; it lives in that panel's browser storage, so it changes if the storage is cleared. Panels only hear events while the page is visible.
+
+> ⚠️ **Events only work if the dashboard's token belongs to an admin user** (Home Assistant only lets admins subscribe to custom events). **Don't switch to an admin token for this yet:** the config API returns the stored token to anyone who can reach the dashboard on your network, and an admin token gives full control of Home Assistant. With a normal token the event subscription is simply skipped (a console warning) and everything else, including `?camera=`, keeps working.
 
 ## Customization
 

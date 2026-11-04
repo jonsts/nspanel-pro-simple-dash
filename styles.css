@@ -17,6 +17,16 @@
     --tile-label-size:  14px;
     --tile-state-size:  10px;
 
+    /* Clock tile — sized in container query height units (% of the tile's own
+       rendered height) so the font scales with tile height automatically,
+       however many grid rows the room is configured with */
+    --clock-time-size:                         29cqh;
+    --clock-time-size--full-width:             42cqh;
+    --clock-time-size--half-height:            56cqh;
+    --clock-time-size--full-width-half-height: 74cqh;
+    --clock-date-size:             9cqh;
+    --clock-date-size--full-width: 11cqh;
+
     /* Modal */
     --modal-width: 380px;
 
@@ -471,9 +481,50 @@ body {
     color: #4caf50;
 }
 
-.tile.lock.on .tile-icon,
-.tile.lock.on .tile-state {
+.tile.lock.state--unlocked .tile-icon,
+.tile.lock.state--unlocked .tile-state {
     color: #ef5350;
+}
+
+.tile.alarm_control_panel .tile-icon,
+.tile.alarm_control_panel .tile-state {
+    color: #4caf50;
+}
+
+.tile.alarm_control_panel.armed {
+    background: linear-gradient(135deg, rgba(66, 165, 245, 0.15) 0%, rgba(33, 150, 243, 0.05) 100%);
+    border-color: rgba(66, 165, 245, 0.3);
+}
+
+.tile.alarm_control_panel.armed .tile-icon,
+.tile.alarm_control_panel.armed .tile-state {
+    color: #42a5f5;
+}
+
+.tile.alarm_control_panel.pending {
+    background: linear-gradient(135deg, rgba(255, 193, 7, 0.15) 0%, rgba(255, 193, 7, 0.05) 100%);
+    border-color: rgba(255, 193, 7, 0.3);
+}
+
+.tile.alarm_control_panel.pending .tile-icon,
+.tile.alarm_control_panel.pending .tile-state {
+    color: #ffc107;
+}
+
+.tile.alarm_control_panel.triggered {
+    background: linear-gradient(135deg, rgba(239, 83, 80, 0.25) 0%, rgba(239, 83, 80, 0.1) 100%);
+    border-color: rgba(239, 83, 80, 0.5);
+    animation: alarm-tile-pulse 1s ease-in-out infinite;
+}
+
+.tile.alarm_control_panel.triggered .tile-icon,
+.tile.alarm_control_panel.triggered .tile-state {
+    color: #ef5350;
+}
+
+@keyframes alarm-tile-pulse {
+    0%, 100% { box-shadow: 0 8px 24px rgba(239, 83, 80, 0.2); }
+    50% { box-shadow: 0 8px 24px rgba(239, 83, 80, 0.55); }
 }
 
 .tile.sensor {
@@ -546,6 +597,7 @@ body {
 }
 
 .tile.clock {
+    container-type: size;
     background: rgba(var(--fg-rgb), 0.05);
     border-color: rgba(var(--fg-rgb), 0.1);
     cursor: default;
@@ -555,20 +607,36 @@ body {
 }
 
 .clock-time {
-    font-size: 32px;
+    font-size: clamp(16px, var(--clock-time-size), 64px);
     font-weight: 200;
     letter-spacing: -0.5px;
     margin: 4px 0;
     line-height: 1;
 }
 
+.tile.clock[data-full-width] .clock-time {
+    font-size: clamp(20px, var(--clock-time-size--full-width), 72px);
+}
+
+.tile.clock[data-height="half"] .clock-time {
+    font-size: clamp(14px, var(--clock-time-size--half-height), 36px);
+}
+
+.tile.clock[data-full-width][data-height="half"] .clock-time {
+    font-size: clamp(16px, var(--clock-time-size--full-width-half-height), 44px);
+}
+
 .clock-date {
-    font-size: 11px;
+    font-size: clamp(9px, var(--clock-date-size), 15px);
     font-weight: 400;
     opacity: 0.6;
     text-transform: uppercase;
     letter-spacing: 0.8px;
     margin-top: 4px;
+}
+
+.tile.clock[data-full-width] .clock-date {
+    font-size: clamp(10px, var(--clock-date-size--full-width), 17px);
 }
 
 .weather-icon {
@@ -1020,6 +1088,10 @@ body {
 .tile.tile-half-height.sensor,
 .tile.tile-half-height.climate {
     justify-content: space-between;
+}
+
+.tile.tile-half-height.clock {
+    column-gap: 12px;
 }
 
 .tile.assistant-command {
@@ -1716,6 +1788,169 @@ body {
 
 .climate-mode-btn:active {
     transform: scale(0.96);
+}
+
+/* Alarm Control Modal */
+/* Camera stream modal: as wide as the panel allows, video letterboxed in 16:9 */
+.camera-modal-content {
+    width: 96%;
+    max-width: min(96%, 720px);
+}
+
+/* Portrait cameras: as tall as the screen allows, without getting wider than it */
+.camera-modal-content.portrait {
+    width: auto;
+    min-width: 280px;
+}
+
+.camera-modal-content.portrait .camera-view {
+    width: auto;
+    height: min(70vh, 640px, calc(96vw * var(--camera-ratio)));
+    margin: 0 auto;
+}
+
+/* Big, obvious close target: the stream is easy to leave running otherwise */
+.camera-modal-close {
+    width: 56px;
+    height: 56px;
+    margin: -12px -12px -12px 12px;
+    padding: 0;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: rgba(var(--fg-rgb), 0.12);
+    color: rgba(var(--fg-rgb), 0.9);
+    font-size: 32px;
+}
+
+.camera-modal-close:active {
+    background: rgba(var(--fg-rgb), 0.25);
+}
+
+.camera-modal-content .climate-modal-body {
+    padding: 0;
+}
+
+.camera-view {
+    position: relative;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #000;
+    overflow: hidden;
+}
+
+.camera-view video,
+.camera-view img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+}
+
+.camera-status {
+    min-height: 1.4em;
+    margin: 10px 0;
+    padding: 0 16px;
+    font-size: 12px;
+    opacity: 0.6;
+    text-align: center;
+}
+
+.alarm-status {
+    text-align: center;
+    margin-bottom: 24px;
+}
+
+.alarm-status-icon {
+    font-family: 'Material Symbols Outlined';
+    font-size: 44px;
+    color: rgba(255, 255, 255, 0.7);
+    margin-bottom: 8px;
+}
+
+.alarm-status-text {
+    font-size: 20px;
+    font-weight: 500;
+    letter-spacing: 0.3px;
+}
+
+.alarm-status.disarmed .alarm-status-icon,
+.alarm-status.disarmed .alarm-status-text {
+    color: #4caf50;
+}
+
+.alarm-status.armed .alarm-status-icon,
+.alarm-status.armed .alarm-status-text {
+    color: #42a5f5;
+}
+
+.alarm-status.pending .alarm-status-icon,
+.alarm-status.pending .alarm-status-text {
+    color: #ffc107;
+}
+
+.alarm-status.triggered .alarm-status-icon,
+.alarm-status.triggered .alarm-status-text {
+    color: #ef5350;
+}
+
+.alarm-code-entry {
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    gap: 16px;
+}
+
+.alarm-code-display {
+    font-size: 26px;
+    letter-spacing: 8px;
+    min-height: 32px;
+    color: rgba(255, 255, 255, 0.85);
+    text-align: center;
+}
+
+.alarm-code-text-input {
+    text-align: center;
+    letter-spacing: 4px;
+}
+
+.alarm-code-keypad {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    width: 100%;
+}
+
+.alarm-code-key {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: #fff;
+    padding: 16px;
+    border-radius: 12px;
+    font-size: 18px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.alarm-code-key:hover {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+.alarm-code-key:active {
+    background: rgba(255, 255, 255, 0.15);
+    transform: scale(0.94);
+}
+
+.alarm-code-actions {
+    display: flex;
+    gap: 10px;
+    width: 100%;
+}
+
+.alarm-code-actions button {
+    flex: 1;
+    width: auto;
+    margin-top: 0;
 }
 
 /* Weather Forecast Modal */
